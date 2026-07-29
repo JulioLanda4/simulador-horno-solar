@@ -106,6 +106,170 @@ def v_unit(a: tuple[float, float, float]) -> tuple[float, float, float]:
     return (a[0] / n, a[1] / n, a[2] / n)
 
 
+def intersect_ray_plane(
+    ray_origin: tuple[float, float, float],
+    ray_direction: tuple[float, float, float],
+    plane_point: tuple[float, float, float],
+    plane_normal: tuple[float, float, float],
+    epsilon: float = 1e-9,
+) -> tuple[tuple[float, float, float] | None, float | None]:
+    """Calcula la interseccion entre un rayo 3D y un plano.
+
+    Todos los puntos usan coordenadas globales en metros con la convencion del
+    proyecto: ``+x`` oeste, ``+y`` sur y ``+z`` cenit. Las direcciones se
+    normalizan internamente, por lo que ``t`` tambien queda expresado en metros.
+
+    Retorna ``(None, None)`` si una direccion es nula, si el rayo es paralelo al
+    plano o si el cruce queda detras del origen. Un cruce en el propio origen es
+    valido y retorna ``t = 0``.
+    """
+    if v_norm(ray_direction) < epsilon or v_norm(plane_normal) < epsilon:
+        return None, None
+    direction = v_unit(ray_direction)
+    normal = v_unit(plane_normal)
+    denominator = v_dot(direction, normal)
+    if abs(denominator) < epsilon:
+        return None, None
+    t = v_dot(v_sub(plane_point, ray_origin), normal) / denominator
+    if t < -epsilon:
+        return None, None
+    t = max(0.0, t)
+    return v_add(ray_origin, v_mul(direction, t)), t
+
+
+def world_to_target_coordinates(
+    point: tuple[float, float, float],
+    target_center: tuple[float, float, float],
+    target_u_axis: tuple[float, float, float],
+    target_v_axis: tuple[float, float, float],
+) -> tuple[float, float]:
+    """Convierte un punto global a coordenadas locales ``(u, v)`` del target.
+
+    Los puntos estan en metros y usan ``+x`` oeste, ``+y`` sur, ``+z`` cenit.
+    ``u`` es horizontal sobre el target y se orienta hacia el oeste para el
+    target nominal situado al sur. ``v`` es vertical y positivo hacia el cenit.
+    Los ejes se normalizan y ``v`` se ortogonaliza respecto de ``u``.
+
+    Lanza ``ValueError`` si alguno de los ejes no permite definir un marco 2D.
+    """
+    if v_norm(target_u_axis) < 1e-12 or v_norm(target_v_axis) < 1e-12:
+        raise ValueError("Los ejes locales del target no pueden ser nulos")
+    u_axis = v_unit(target_u_axis)
+    v_orthogonal = v_sub(target_v_axis, v_mul(u_axis, v_dot(target_v_axis, u_axis)))
+    if v_norm(v_orthogonal) < 1e-12:
+        raise ValueError("Los ejes locales del target no pueden ser paralelos")
+    v_axis = v_unit(v_orthogonal)
+    relative = v_sub(point, target_center)
+    return v_dot(relative, u_axis), v_dot(relative, v_axis)
+
+
+def target_coordinate_frame(
+    target_center: tuple[float, float, float],
+) -> tuple[
+    tuple[float, float, float],
+    tuple[float, float, float],
+    tuple[float, float, float],
+]:
+    """Construye normal, eje horizontal ``u`` y eje vertical ``v`` del target.
+
+    El plano mira desde el heliostato, situado en el origen optico, hacia el
+    centro del target. Para la geometria nominal al sur, ``u`` coincide con
+    ``+x`` (oeste) y ``v`` con ``+z`` (cenit). Si el target queda exactamente
+    sobre el eje vertical se elige un marco horizontal estable.
+    """
+    normal = v_unit(target_center)
+    if v_norm(normal) < 1e-12:
+        raise ValueError("El centro del target no puede coincidir con el origen optico")
+    global_up = (0.0, 0.0, 1.0)
+    u_axis = v_cross(normal, global_up)
+    if v_norm(u_axis) < 1e-12:
+        u_axis = (1.0, 0.0, 0.0)
+    else:
+        u_axis = v_unit(u_axis)
+    v_axis = v_sub(global_up, v_mul(normal, v_dot(global_up, normal)))
+    if v_norm(v_axis) < 1e-12:
+        v_axis = v_cross(normal, u_axis)
+    return normal, u_axis, v_unit(v_axis)
+
+
+def classify_target_error(radial_error_m: float, tolerance_m: float) -> str:
+    """Clasifica el impacto a partir del error radial y la tolerancia en metros."""
+    tolerance = max(0.0, tolerance_m)
+    centered_limit = max(1e-9, 0.25 * tolerance)
+    if radial_error_m <= centered_limit:
+        return "centrado"
+    if radial_error_m <= tolerance:
+        return "aceptable"
+    return "fuera de tolerancia"
+
+
+@dataclass(frozen=True)
+class TargetImpact:
+    """Resultado geometrico de proyectar un rayo sobre el target virtual."""
+
+    point: tuple[float, float, float] | None
+    ray_parameter_m: float | None
+    u_m: float | None
+    v_m: float | None
+    radial_error_m: float | None
+    angular_error_deg: float | None
+    status: str
+    plane_normal: tuple[float, float, float]
+    u_axis: tuple[float, float, float]
+    v_axis: tuple[float, float, float]
+
+
+def compute_target_impact(
+    ray_origin: tuple[float, float, float],
+    ray_direction: tuple[float, float, float],
+    target_center: tuple[float, float, float],
+    tolerance_m: float,
+) -> TargetImpact:
+    """Calcula impacto, coordenadas locales y errores del target virtual.
+
+    Las posiciones estan en metros en el marco global ``oeste/sur/cenit``. El
+    error angular es la aproximacion ``atan(error radial / distancia al centro)``.
+    Si no existe una interseccion frontal valida, las magnitudes del impacto son
+    ``None`` y el estado es ``sin impacto``.
+    """
+    normal, u_axis, v_axis = target_coordinate_frame(target_center)
+    point, ray_parameter = intersect_ray_plane(
+        ray_origin,
+        ray_direction,
+        target_center,
+        normal,
+    )
+    if point is None or ray_parameter is None:
+        return TargetImpact(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "sin impacto",
+            normal,
+            u_axis,
+            v_axis,
+        )
+    u_m, v_m = world_to_target_coordinates(point, target_center, u_axis, v_axis)
+    radial_error_m = math.hypot(u_m, v_m)
+    center_distance_m = v_norm(v_sub(target_center, ray_origin))
+    angular_error_deg = math.atan2(radial_error_m, max(center_distance_m, 1e-12)) * RAD
+    return TargetImpact(
+        point,
+        ray_parameter,
+        u_m,
+        v_m,
+        radial_error_m,
+        angular_error_deg,
+        classify_target_error(radial_error_m, tolerance_m),
+        normal,
+        u_axis,
+        v_axis,
+    )
+
+
 def normal_from_angles(acim_deg: float, elev_deg: float) -> tuple[float, float, float]:
     """Convierte acimut/elevacion del heliostato en un vector normal 3D."""
     acim = acim_deg * DEG
@@ -340,6 +504,8 @@ class TwinState:
     camera_offset_acim: float = 0.0
     cdr: float = 0.07
     delay_s: float = 0.05
+    target_scale_m: float = 0.10
+    target_tolerance_m: float = 0.010
     mirror_size_m: float = 0.20
     base_width_m: float = 0.19
     fork_height_m: float = 0.22
@@ -364,7 +530,18 @@ class TwinState:
     target_saturated: bool = False
     spot_error_x: float = 0.0
     spot_error_z: float = 0.0
+    spot_error_u: float = 0.0
+    spot_error_v: float = 0.0
+    spot_error_radial: float = 0.0
+    spot_error_angular_deg: float = 0.0
+    spot_status: str = "centrado"
+    spot_valid: bool = True
+    spot_ray_t: float = 0.0
     spot_point: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    reflected_direction: tuple[float, float, float] = (0.0, 1.0, 0.0)
+    target_plane_normal: tuple[float, float, float] = (0.0, 1.0, 0.0)
+    target_u_axis: tuple[float, float, float] = (1.0, 0.0, 0.0)
+    target_v_axis: tuple[float, float, float] = (0.0, 0.0, 1.0)
     sun_vector: tuple[float, float, float] = (0.0, 1.0, 0.0)
     target_vector: tuple[float, float, float] = (0.0, 1.0, 0.0)
     ideal_normal: tuple[float, float, float] = (0.0, 1.0, 0.0)
@@ -413,32 +590,53 @@ class TwinState:
         self.compute_spot_error()
 
     def compute_spot_error(self) -> None:
-        """Calcula donde cae el rayo reflejado sobre el plano del target.
+        """Calcula el cruce real del rayo reflejado con el target virtual.
 
         Usa la ley de reflexion:
             reflejado = incidente - 2 * dot(incidente, normal) * normal
 
-        Luego intersecta ese rayo con el eje hacia el target y proyecta el error
-        en una pantalla local. Los errores X/Z se guardan en metros.
+        El target es un plano que pasa por ``target_vector`` y cuya normal apunta
+        desde el origen optico hacia su centro. Su eje ``u`` es horizontal y
+        positivo hacia el oeste; ``v`` es vertical y positivo hacia el cenit.
+        Todas las posiciones y errores lineales se guardan en metros.
         """
-        t_unit = v_unit(self.target_vector)
         incoming = v_mul(self.sun_vector, -1.0)
-        reflected = v_sub(incoming, v_mul(self.actual_normal, 2.0 * v_dot(incoming, self.actual_normal)))
-        denom = v_dot(reflected, t_unit)
-        if abs(denom) < 1e-9:
+        self.reflected_direction = v_unit(
+            v_sub(incoming, v_mul(self.actual_normal, 2.0 * v_dot(incoming, self.actual_normal)))
+        )
+        try:
+            impact = compute_target_impact(
+                (0.0, 0.0, 0.0),
+                self.reflected_direction,
+                self.target_vector,
+                self.target_tolerance_m,
+            )
+        except ValueError:
+            impact = None
+        if impact is None or impact.point is None:
             self.spot_point = (float("nan"), float("nan"), float("nan"))
-            self.spot_error_x = 0.0
-            self.spot_error_z = 0.0
+            self.spot_error_x = self.spot_error_z = float("nan")
+            self.spot_error_u = self.spot_error_v = float("nan")
+            self.spot_error_radial = float("nan")
+            self.spot_error_angular_deg = float("nan")
+            self.spot_status = "sin impacto"
+            self.spot_valid = False
+            self.spot_ray_t = float("nan")
             return
-        distance = v_dot(self.target_vector, t_unit) / denom
-        self.spot_point = v_mul(reflected, distance)
-        error_vec = v_sub(self.spot_point, self.target_vector)
-        screen_x = v_unit(v_cross((0.0, 0.0, 1.0), t_unit))
-        if v_norm(screen_x) < 1e-9:
-            screen_x = (1.0, 0.0, 0.0)
-        screen_z = v_unit(v_cross(t_unit, screen_x))
-        self.spot_error_x = v_dot(error_vec, screen_x)
-        self.spot_error_z = v_dot(error_vec, screen_z)
+        self.spot_point = impact.point
+        self.spot_ray_t = float(impact.ray_parameter_m)
+        self.spot_error_u = float(impact.u_m)
+        self.spot_error_v = float(impact.v_m)
+        self.spot_error_radial = float(impact.radial_error_m)
+        self.spot_error_angular_deg = float(impact.angular_error_deg)
+        self.spot_status = impact.status
+        self.spot_valid = True
+        self.target_plane_normal = impact.plane_normal
+        self.target_u_axis = impact.u_axis
+        self.target_v_axis = impact.v_axis
+        # Alias conservados para no romper historiales, replay ni CSV previos.
+        self.spot_error_x = self.spot_error_u
+        self.spot_error_z = self.spot_error_v
 
     def update(self, dt: float, target_override: tuple[float, float] | None = None) -> None:
         """Avanza un paso temporal de la simulacion.
@@ -461,6 +659,11 @@ class TwinState:
             self.el.update_closed_loop(dt, self.cdr)
         else:
             self.az.ina = self.az.inb = self.el.ina = self.el.inb = 0
+        # Los motores pueden cambiar la normal durante este mismo paso. El
+        # impacto se vuelve a calcular para que la pantalla no lleve un ciclo de
+        # retraso respecto de los angulos mostrados.
+        self.actual_normal = normal_from_angles(self.az.angle_deg, self.el.angle_deg + self.peralte)
+        self.compute_spot_error()
         self.iterations += 1
         self.history.append(
             {
@@ -471,6 +674,10 @@ class TwinState:
                 "el_target": self.el.target_deg,
                 "err_x": self.spot_error_x,
                 "err_z": self.spot_error_z,
+                "err_u": self.spot_error_u,
+                "err_v": self.spot_error_v,
+                "err_radial": self.spot_error_radial,
+                "spot_valid": self.spot_valid,
                 "spot": self.spot_point,
             }
         )
@@ -686,6 +893,8 @@ class DigitalTwinApp:
             "camera_offset_acim",
             "cdr",
             "delay_s",
+            "target_scale_m",
+            "target_tolerance_m",
             "mirror_size_m",
             "base_width_m",
             "fork_height_m",
@@ -895,28 +1104,30 @@ class DigitalTwinApp:
         self.add_entry(grid, "Horquilla alto (m)", "fork_height_m", 2, 0)
         self.add_entry(grid, "Riel largo (m)", "rail_length_m", 2, 2)
         self.add_entry(grid, "Pantalla diam. (m)", "receiver_screen_m", 3, 0)
-        self.add_entry(grid, "Zona cdr x", "uncertainty_gain", 3, 2)
+        self.add_entry(grid, "Escala target +/- (m)", "target_scale_m", 3, 2)
+        self.add_entry(grid, "Tolerancia target (m)", "target_tolerance_m", 4, 0)
+        self.add_entry(grid, "Zona cdr x", "uncertainty_gain", 4, 2)
         ttk.Label(
             grid,
-            text="Estos valores solo ajustan la apariencia y la zona de tolerancia visual.",
+            text="La escala controla el rango visible del target; la tolerancia define la zona aceptable.",
             style="Small.TLabel",
             wraplength=440,
             justify="left",
-        ).grid(row=4, column=0, columnspan=4, sticky="ew", padx=2, pady=(2, 8))
-        ttk.Label(grid, text="Limites y velocidad del movimiento simulado", style="Small.TLabel").grid(row=5, column=0, columnspan=4, sticky="w", padx=2, pady=(2, 4))
-        self.add_entry(grid, "Acimut min (deg)", "az_limit_min", 6, 0)
-        self.add_entry(grid, "Acimut max (deg)", "az_limit_max", 6, 2)
-        self.add_entry(grid, "Elev min (deg)", "el_limit_min", 7, 0)
-        self.add_entry(grid, "Elev max (deg)", "el_limit_max", 7, 2)
-        self.add_entry(grid, "Vel acimut (deg/s)", "az_deg_per_second", 8, 0)
-        self.add_entry(grid, "Vel elev (deg/s)", "el_deg_per_second", 8, 2)
+        ).grid(row=5, column=0, columnspan=4, sticky="ew", padx=2, pady=(2, 8))
+        ttk.Label(grid, text="Limites y velocidad del movimiento simulado", style="Small.TLabel").grid(row=6, column=0, columnspan=4, sticky="w", padx=2, pady=(2, 4))
+        self.add_entry(grid, "Acimut min (deg)", "az_limit_min", 7, 0)
+        self.add_entry(grid, "Acimut max (deg)", "az_limit_max", 7, 2)
+        self.add_entry(grid, "Elev min (deg)", "el_limit_min", 8, 0)
+        self.add_entry(grid, "Elev max (deg)", "el_limit_max", 8, 2)
+        self.add_entry(grid, "Vel acimut (deg/s)", "az_deg_per_second", 9, 0)
+        self.add_entry(grid, "Vel elev (deg/s)", "el_deg_per_second", 9, 2)
         ttk.Label(
             grid,
             text="Los conteos de encoder se mantienen internos porque vienen de la escala del VI/LabVIEW y no suelen requerir ajuste manual.",
             style="Small.TLabel",
             wraplength=440,
             justify="left",
-        ).grid(row=9, column=0, columnspan=4, sticky="ew", padx=2, pady=(4, 2))
+        ).grid(row=10, column=0, columnspan=4, sticky="ew", padx=2, pady=(4, 2))
         for col in (1, 3):
             grid.columnconfigure(col, weight=1)
 
@@ -946,7 +1157,7 @@ class DigitalTwinApp:
             ("Acimut Target + Offset", "target_acim"),
             ("Counter Ele", "el_counts"),
             ("Counter Acim", "az_counts"),
-            ("Spot X/Z mm", "spot"),
+            ("Impacto U/V mm", "spot"),
             ("Error angular", "angular_error"),
             ("Limites", "limit_status"),
             ("Estado motores", "motor_status"),
@@ -1043,6 +1254,8 @@ class DigitalTwinApp:
             messages.append(("critica", self.invalid_time_text))
         if s.altitude <= 0.0:
             messages.append(("critica", "Sol bajo horizonte: geometria no operativa"))
+        if not s.spot_valid:
+            messages.append(("critica", "El rayo reflejado no intersecta el target al frente"))
         az_err, el_err = self.axis_errors()
         if self.current_mode in ("auto", "home") and (abs(az_err) > s.cdr or abs(el_err) > s.cdr):
             if not s.az.motor_on or not s.el.motor_on:
@@ -1238,6 +1451,8 @@ class DigitalTwinApp:
         # Saneamiento de parametros para evitar valores negativos o imposibles.
         self.state.cdr = max(0.0, float(self.state.cdr))
         self.state.delay_s = max(0.01, float(self.state.delay_s))
+        self.state.target_scale_m = max(0.001, float(self.state.target_scale_m))
+        self.state.target_tolerance_m = max(0.0, float(self.state.target_tolerance_m))
         self.state.mirror_size_m = max(0.05, float(self.state.mirror_size_m))
         self.state.base_width_m = max(0.05, float(self.state.base_width_m))
         self.state.fork_height_m = max(0.05, float(self.state.fork_height_m))
@@ -1261,6 +1476,12 @@ class DigitalTwinApp:
             "el_error_deg": s.el.target_deg - s.el.angle_deg,
             "spot_x_mm": s.spot_error_x * 1000.0,
             "spot_z_mm": s.spot_error_z * 1000.0,
+            "spot_u_mm": s.spot_error_u * 1000.0,
+            "spot_v_mm": s.spot_error_v * 1000.0,
+            "spot_radial_mm": s.spot_error_radial * 1000.0,
+            "spot_angular_error_deg": s.spot_error_angular_deg,
+            "spot_status": s.spot_status,
+            "spot_valid": s.spot_valid,
             "zenith_deg": s.zenith,
             "altitude_deg": s.altitude,
             "solar_azimuth_deg": s.solar_azimuth,
@@ -1289,6 +1510,14 @@ class DigitalTwinApp:
         s.el.target_deg = float(sample["el_target_deg"])
         s.spot_error_x = float(sample["spot_x_mm"]) / 1000.0
         s.spot_error_z = float(sample["spot_z_mm"]) / 1000.0
+        s.spot_error_u = float(sample.get("spot_u_mm", sample["spot_x_mm"])) / 1000.0
+        s.spot_error_v = float(sample.get("spot_v_mm", sample["spot_z_mm"])) / 1000.0
+        s.spot_error_radial = float(
+            sample.get("spot_radial_mm", math.hypot(s.spot_error_u, s.spot_error_v) * 1000.0)
+        ) / 1000.0
+        s.spot_error_angular_deg = float(sample.get("spot_angular_error_deg", 0.0))
+        s.spot_status = str(sample.get("spot_status", classify_target_error(s.spot_error_radial, s.target_tolerance_m)))
+        s.spot_valid = bool(sample.get("spot_valid", True))
         s.zenith = float(sample["zenith_deg"])
         s.altitude = float(sample["altitude_deg"])
         s.solar_azimuth = float(sample["solar_azimuth_deg"])
@@ -1412,6 +1641,11 @@ class DigitalTwinApp:
         self.state_banner.configure(text=f"Estado: {status_label}", bg=status_color)
         self.state_detail.configure(text=status_detail)
         limit_text = "; ".join(self.limit_messages()) if self.limit_messages() else "Dentro de rango"
+        impact_text = (
+            f"{s.spot_error_u * 1000.0:7.1f} / {s.spot_error_v * 1000.0:7.1f}"
+            if s.spot_valid
+            else "SIN IMPACTO"
+        )
         values = {
             "zenith": f"{s.zenith:8.4f}",
             "altitude": f"{s.altitude:8.4f}",
@@ -1422,7 +1656,7 @@ class DigitalTwinApp:
             "target_acim": f"{s.az.target_deg:8.4f}",
             "el_counts": f"{s.el.counts:d}",
             "az_counts": f"{s.az.counts:d}",
-            "spot": f"{s.spot_error_x * 1000.0:7.1f} / {s.spot_error_z * 1000.0:7.1f}",
+            "spot": impact_text,
             "angular_error": f"{wrap_deg(s.az.target_deg - s.az.angle_deg):6.2f} / {s.el.target_deg - s.el.angle_deg:6.2f}",
             "limit_status": limit_text,
             "motor_status": f"AZ {'ON' if s.az.motor_on else 'OFF'} | EL {'ON' if s.el.motor_on else 'OFF'}",
@@ -1624,10 +1858,8 @@ class DigitalTwinApp:
         rail_end = max(self.state.rail_length_m, target[1] + 0.08)
         self.line3d(c, (0, 0, -0.015), (0, rail_end, -0.015), "#d7d7d7", 4)
         t_unit = v_unit(target)
-        sx = v_unit(v_cross((0, 0, 1), t_unit))
-        if v_norm(sx) < 1e-9:
-            sx = (1, 0, 0)
-        sz = v_unit(v_cross(t_unit, sx))
+        sx = self.state.target_u_axis
+        sz = self.state.target_v_axis
         ring_radius = clamp(self.state.receiver_screen_m, 0.06, 0.24)
         table_z = -0.015
         table_y = target[1]
@@ -1665,7 +1897,10 @@ class DigitalTwinApp:
         # desde el espejo hacia el concentrador. El cono muestra tolerancia cdr.
         sun_start = v_add(center, v_mul(self.state.sun_vector, 0.35))
         self.line3d(c, sun_start, center, "#ffbf4d", 3, dash=(5, 3))
-        self.line3d(c, center, target_center, "#ffef6a", 3)
+        reflected_end = target_center
+        if self.state.spot_valid:
+            reflected_end = v_add(self.state.spot_point, (0.0, 0.0, 0.12))
+        self.line3d(c, center, reflected_end, "#ffef6a", 3)
         self.text3d(c, v_add(sun_start, (0.0, 0.0, 0.035)), "Sol", "#ffcf69")
         self.text3d(c, v_add(v_add(center, v_mul(n, 0.18)), (0.0, 0.0, 0.025)), "Normal", "#f8d447")
         target_distance = max(0.05, v_norm(self.state.target_vector))
@@ -1685,10 +1920,15 @@ class DigitalTwinApp:
         status_label, status_color, status_detail = self.system_status()
         sun_side = "Oeste" if self.state.sun_vector[0] > 0.02 else "Este" if self.state.sun_vector[0] < -0.02 else "Centro"
         normal_side = "Oeste" if self.state.ideal_normal[0] > 0.02 else "Este" if self.state.ideal_normal[0] < -0.02 else "Centro"
+        spot_info = (
+            f"Impacto U/V {self.state.spot_error_u * 1000.0:+7.1f}, {self.state.spot_error_v * 1000.0:+7.1f} mm"
+            if self.state.spot_valid
+            else "Impacto: sin interseccion frontal"
+        )
         info = (
             f"Acim actual {self.state.az.angle_deg:6.2f} deg  -> {self.state.az.target_deg:6.2f} deg\n"
             f"Elev actual {self.state.el.angle_deg:6.2f} deg  -> {self.state.el.target_deg:6.2f} deg\n"
-            f"Spot error {self.state.spot_error_x * 1000.0:7.1f} mm, {self.state.spot_error_z * 1000.0:7.1f} mm\n"
+            f"{spot_info}\n"
             f"Sol: {sun_side} | Normal ideal: {normal_side}\n"
             f"Vista: {self.vars['view_mode'].get()} | Concentrador: 18 facetas"
         )
@@ -1730,54 +1970,127 @@ class DigitalTwinApp:
         c.create_text(right - 5, bottom - 13, anchor="ne", text=f"{ymin:.1f}", fill="#555555", font=("Consolas", 8))
 
     def draw_receiver_view(self) -> None:
-        """Dibuja la pantalla del concentrador y la posicion del spot.
+        """Dibuja el target virtual y el impacto calculado del rayo reflejado.
 
-        Verde = objetivo ideal en el centro de la pantalla.
-        Rojo = punto donde el modelo calcula que cae el rayo reflejado.
-        La linea roja muestra el historial reciente del spot.
+        El eje ``u`` es horizontal y positivo hacia el oeste; ``v`` es vertical
+        y positivo hacia el cenit. La escala y la tolerancia se leen de
+        ``TwinState`` en metros. Si el impacto cae fuera de escala, el marcador
+        se fija al borde en su direccion real y se rotula como fuera de vista.
         """
         c = self.receiver_canvas
         c.delete("all")
         w, h = max(1, c.winfo_width()), max(1, c.winfo_height())
         c.create_rectangle(0, 0, w, h, fill="#f4f4f4", outline="")
         hist = list(self.state.history)
-        c.create_text(24, 22, anchor="w", text="Pantalla del concentrador: posicion del spot", fill="#111111", font=("Segoe UI", 15, "bold"))
-        cx, cy = w * 0.43, h * 0.52
-        radius = min(w, h) * 0.34
-        c.create_oval(cx - radius, cy - radius, cx + radius, cy + radius, fill="#e9dec0", outline="#7a6b44", width=3)
-        c.create_line(cx - radius, cy, cx + radius, cy, fill="#a09068", width=1)
-        c.create_line(cx, cy - radius, cx, cy + radius, fill="#a09068", width=1)
-        for r in (0.25, 0.5, 0.75):
-            rr = radius * r
-            c.create_oval(cx - rr, cy - rr, cx + rr, cy + rr, outline="#c2b28a")
-        for i in range(18):
-            a = TAU * i / 18.0
-            c.create_line(cx, cy, cx + math.cos(a) * radius, cy + math.sin(a) * radius, fill="#d0bf96")
-        scale = radius / 160.0
+        c.create_text(24, 22, anchor="w", text="Target virtual: interseccion rayo-plano", fill="#111111", font=("Segoe UI", 15, "bold"))
+        cx, cy = w * 0.37, h * 0.52
+        half_pixels = max(40.0, min(w * 0.31, h * 0.40))
+        half_range_m = max(0.001, self.state.target_scale_m)
+        pixels_per_m = half_pixels / half_range_m
+        left, right = cx - half_pixels, cx + half_pixels
+        top, bottom = cy - half_pixels, cy + half_pixels
+        c.create_rectangle(left, top, right, bottom, fill="#fbf8ed", outline="#6f6040", width=3)
+
+        # Reticula uniforme; las etiquetas expresan milimetros locales.
+        divisions = 4
+        for i in range(-divisions, divisions + 1):
+            offset = half_pixels * i / divisions
+            color = "#8a7b58" if i == 0 else "#d6c9a8"
+            width_line = 2 if i == 0 else 1
+            c.create_line(cx + offset, top, cx + offset, bottom, fill=color, width=width_line)
+            c.create_line(left, cy - offset, right, cy - offset, fill=color, width=width_line)
+            value_mm = half_range_m * 1000.0 * i / divisions
+            if i != 0:
+                c.create_text(cx + offset, bottom + 13, text=f"{value_mm:.0f}", fill="#5d5138", font=("Consolas", 8))
+                c.create_text(left - 8, cy - offset, anchor="e", text=f"{value_mm:.0f}", fill="#5d5138", font=("Consolas", 8))
+        c.create_text(right, bottom + 30, anchor="e", text="u [mm]  oeste +", fill="#333333", font=("Segoe UI", 9, "bold"))
+        c.create_text(left, top - 16, anchor="w", text="v [mm]  cenit +", fill="#333333", font=("Segoe UI", 9, "bold"))
+
+        screen_radius_px = min(half_pixels, 0.5 * self.state.receiver_screen_m * pixels_per_m)
+        c.create_oval(
+            cx - screen_radius_px,
+            cy - screen_radius_px,
+            cx + screen_radius_px,
+            cy + screen_radius_px,
+            outline="#9b7a2f",
+            width=2,
+        )
+        tolerance_px = min(half_pixels, self.state.target_tolerance_m * pixels_per_m)
+        c.create_oval(
+            cx - tolerance_px,
+            cy - tolerance_px,
+            cx + tolerance_px,
+            cy + tolerance_px,
+            outline="#159447",
+            width=3,
+            dash=(5, 3),
+        )
+
         pts = []
         for p in hist[-220:]:
-            x = cx + p["err_x"] * 1000.0 * scale
-            y = cy - p["err_z"] * 1000.0 * scale
-            if cx - radius <= x <= cx + radius and cy - radius <= y <= cy + radius:
+            if not p.get("spot_valid", True):
+                continue
+            u_m = float(p.get("err_u", p["err_x"]))
+            v_m = float(p.get("err_v", p["err_z"]))
+            x = cx + u_m * pixels_per_m
+            y = cy - v_m * pixels_per_m
+            if left <= x <= right and top <= y <= bottom:
                 pts.extend([x, y])
         if len(pts) >= 4:
             c.create_line(*pts, fill="#cc3333", width=2)
-        sx = cx + self.state.spot_error_x * 1000.0 * scale
-        sz = cy - self.state.spot_error_z * 1000.0 * scale
         c.create_oval(cx - 6, cy - 6, cx + 6, cy + 6, fill="#2fbf62", outline="#ffffff", width=2)
-        c.create_oval(sx - 8, sz - 8, sx + 8, sz + 8, fill="#ff3030", outline="#ffffff", width=2)
-        tol = max(5.0, self.state.cdr * 35.0) * scale
-        c.create_oval(cx - tol, cy - tol, cx + tol, cy + tol, outline="#31a354", width=2, dash=(5, 3))
-        error_mag = math.hypot(self.state.spot_error_x, self.state.spot_error_z) * 1000.0
-        text_x = w * 0.74
+
+        outside_view = False
+        if self.state.spot_valid:
+            raw_x = cx + self.state.spot_error_u * pixels_per_m
+            raw_y = cy - self.state.spot_error_v * pixels_per_m
+            outside_view = not (left <= raw_x <= right and top <= raw_y <= bottom)
+            marker_x = clamp(raw_x, left, right)
+            marker_y = clamp(raw_y, top, bottom)
+            marker_color = {
+                "centrado": "#16883f",
+                "aceptable": "#e09a16",
+                "fuera de tolerancia": "#d92828",
+            }.get(self.state.spot_status, "#d92828")
+            c.create_oval(marker_x - 8, marker_y - 8, marker_x + 8, marker_y + 8, fill=marker_color, outline="#ffffff", width=2)
+            if outside_view:
+                c.create_text(marker_x, marker_y - 16, text="fuera de escala", fill="#9f1239", font=("Segoe UI", 9, "bold"))
+
+        text_x = w * 0.72
         c.create_rectangle(text_x - 18, 92, w - 28, h - 72, fill="#ffffff", outline="#c7c7c7")
         c.create_text(text_x, 118, anchor="w", text="Lectura directa", fill="#111111", font=("Segoe UI", 13, "bold"))
-        c.create_text(text_x, 160, anchor="w", text=f"Error X: {self.state.spot_error_x * 1000.0:8.1f} mm", fill="#a41d1d", font=("Consolas", 13))
-        c.create_text(text_x, 190, anchor="w", text=f"Error Z: {self.state.spot_error_z * 1000.0:8.1f} mm", fill="#1d6f42", font=("Consolas", 13))
-        c.create_text(text_x, 220, anchor="w", text=f"Error total: {error_mag:7.1f} mm", fill="#111111", font=("Consolas", 13, "bold"))
-        c.create_text(text_x, 250, anchor="w", text=f"cdr: +/- {self.state.cdr:.3f} deg", fill="#111111", font=("Consolas", 12))
-        c.create_text(text_x, 285, anchor="w", text="Verde = objetivo\nRojo = spot simulado\nLinea roja = historial reciente", fill="#333333", font=("Segoe UI", 10))
-        c.create_text(text_x, 365, anchor="w", text="Esta vista responde a la pregunta:\n?donde esta cayendo el rayo?", fill="#555555", font=("Segoe UI", 11))
+        if self.state.spot_valid:
+            readout_lines = (
+                f"Horizontal u: {self.state.spot_error_u * 1000.0:+8.2f} mm\n"
+                f"Vertical v:   {self.state.spot_error_v * 1000.0:+8.2f} mm\n"
+                f"Error radial: {self.state.spot_error_radial * 1000.0:8.2f} mm\n"
+                f"Error angular:{self.state.spot_error_angular_deg:8.4f} deg\n"
+                f"Distancia rayo:{self.state.spot_ray_t:7.3f} m"
+            )
+        else:
+            readout_lines = "El rayo es paralelo al plano\no intersecta el target al frente."
+        c.create_text(text_x, 154, anchor="nw", text=readout_lines, fill="#222222", font=("Consolas", 11))
+        status_color = {
+            "centrado": "#16883f",
+            "aceptable": "#b7791f",
+            "fuera de tolerancia": "#b91c1c",
+            "sin impacto": "#6b7280",
+        }.get(self.state.spot_status, "#6b7280")
+        c.create_rectangle(text_x, 294, w - 46, 328, fill=status_color, outline="")
+        c.create_text(text_x + 10, 311, anchor="w", text=self.state.spot_status.upper(), fill="#ffffff", font=("Segoe UI", 11, "bold"))
+        c.create_text(
+            text_x,
+            350,
+            anchor="nw",
+            text=(
+                f"Escala: +/- {half_range_m * 1000.0:.0f} mm\n"
+                f"Tolerancia: {self.state.target_tolerance_m * 1000.0:.1f} mm\n"
+                f"Pantalla: {self.state.receiver_screen_m * 1000.0:.0f} mm diam.\n"
+                "Centro verde | trayectoria roja"
+            ),
+            fill="#333333",
+            font=("Segoe UI", 10),
+        )
 
     def active_datetime(self) -> _dt.datetime:
         """Devuelve la fecha/hora que esta usando el gemelo en este instante."""
@@ -1850,7 +2163,7 @@ class DigitalTwinApp:
         c.create_text(24, 22, anchor="w", text="Diagnostico de seguimiento", fill="#111111", font=("Segoe UI", 15, "bold"))
         az_err = wrap_deg(self.state.az.target_deg - self.state.az.angle_deg)
         el_err = self.state.el.target_deg - self.state.el.angle_deg
-        spot_err = math.hypot(self.state.spot_error_x, self.state.spot_error_z) * 1000.0
+        spot_err = self.state.spot_error_radial * 1000.0 if self.state.spot_valid else 0.0
         metrics = [
             ("Error acimut", az_err, "deg", 25.0, "#2b6cb0"),
             ("Error elevacion", el_err, "deg", 25.0, "#805ad5"),
@@ -1867,7 +2180,12 @@ class DigitalTwinApp:
         chart_right = w - 42 if w < 980 else w - 520
         box = (42, 350, chart_right, h - 42)
         self.draw_axes(c, *box, "Historial util: error total del spot", "mm")
-        errs = [math.hypot(p["err_x"], p["err_z"]) * 1000.0 for p in hist]
+        errs = [
+            float(p.get("err_radial", math.hypot(p["err_x"], p["err_z"]))) * 1000.0
+            for p in hist
+            if p.get("spot_valid", True)
+            and math.isfinite(float(p.get("err_radial", math.hypot(p["err_x"], p["err_z"]))))
+        ]
         ymax = max(errs + [10.0])
         self.plot_series(c, box, errs, "#c53030", 0.0, min(max(ymax, 10.0), 500.0))
         c.create_text(w - 360, 100, anchor="nw", text=(
@@ -1900,7 +2218,8 @@ class DigitalTwinApp:
             f"R target  = ({s.target_vector[0]:+.3f}, {s.target_vector[1]:+.3f}, {s.target_vector[2]:+.3f}) m\n"
             f"N ideal   = ({s.ideal_normal[0]:+.3f}, {s.ideal_normal[1]:+.3f}, {s.ideal_normal[2]:+.3f})\n"
             f"N actual  = ({s.actual_normal[0]:+.3f}, {s.actual_normal[1]:+.3f}, {s.actual_normal[2]:+.3f})\n"
-            f"Target crudo EL: {s.raw_target_elev:+.2f} deg | Peralte helio: {s.peralte:+.2f} deg"
+            f"Target crudo EL: {s.raw_target_elev:+.2f} deg | Peralte helio: {s.peralte:+.2f} deg\n"
+            f"Impacto: {s.spot_status} | error angular: {s.spot_error_angular_deg:.4f} deg"
         )
         c.create_text(vector_x, vector_y + 74, anchor="nw", text=vector_text, fill="#222222", font=("Consolas", 10))
 
@@ -1983,16 +2302,40 @@ class DigitalTwinApp:
 def run_self_test() -> None:
     """Prueba rapida sin abrir GUI.
 
-    Verifica que el modelo pueda calcular geometria, objetivos y error de spot
-    durante varios pasos sin producir NaN o excepciones.
+    Verifica el modelo completo y los casos esenciales del target virtual sin
+    abrir Tkinter: centro, signo horizontal y rayo paralelo al plano.
     """
     state = TwinState()
+    state.use_live_time = False
+    state.simulated_time = _dt.datetime(2026, 6, 21, 12, 0, 0)
+    state.peralte = 0.0
+    state.compute_geometry()
+    state.az.angle_deg = state.target_acim
+    state.el.angle_deg = state.target_elev
     for _ in range(20):
-        state.compute_geometry()
         state.update(0.05)
     assert math.isfinite(state.target_acim)
     assert math.isfinite(state.target_elev)
-    assert math.isfinite(state.spot_error_x)
+    assert state.spot_valid
+    assert math.isfinite(state.spot_error_radial)
+    assert state.spot_error_radial < 1e-8
+
+    target = (0.0, 5.0, 0.0)
+    centered = compute_target_impact((0.0, 0.0, 0.0), target, target, 0.01)
+    assert centered.point is not None
+    assert centered.radial_error_m is not None and centered.radial_error_m < 1e-9
+    normal, u_axis, v_axis = target_coordinate_frame(target)
+    side_point, _t = intersect_ray_plane((0.0, 0.0, 0.0), (0.1, 1.0, 0.0), target, normal)
+    assert side_point is not None
+    side_u, _side_v = world_to_target_coordinates(side_point, target, u_axis, v_axis)
+    assert side_u > 0.0
+    parallel_point, parallel_t = intersect_ray_plane(
+        (0.0, 0.0, 0.0),
+        (1.0, 0.0, 0.0),
+        target,
+        normal,
+    )
+    assert parallel_point is None and parallel_t is None
     print("self-test ok")
 
 
