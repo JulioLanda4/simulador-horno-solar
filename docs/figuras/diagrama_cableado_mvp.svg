@@ -1,0 +1,136 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1300" height="820" viewBox="0 0 1300 820">
+  <defs>
+    <style>
+      .bg{fill:#f7f8f5}
+      .box{fill:#fff;stroke:#2f3d38;stroke-width:2.4;rx:8}
+      .power{fill:#fff4d7;stroke:#684f13;stroke-width:2.4;rx:8}
+      .motor{fill:#dfeaf4;stroke:#253b50;stroke-width:2.4;rx:8}
+      .sensor{fill:#e6f1e5;stroke:#28482b;stroke-width:2.4;rx:8}
+      .wire{fill:none;stroke:#2f3d38;stroke-width:3}
+      .p12{fill:none;stroke:#c43c2f;stroke-width:4}
+      .gnd{fill:none;stroke:#333;stroke-width:4}
+      .sig{fill:none;stroke:#2868b7;stroke-width:2.8}
+      .enc{fill:none;stroke:#6d44a8;stroke-width:2.8}
+      .txt{font-family:Arial, Helvetica, sans-serif;fill:#18201d}
+      .title{font-size:28px;font-weight:700}
+      .label{font-size:18px;font-weight:700}
+      .small{font-size:14px}
+      .pin{font-size:13px;fill:#26322e}
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#2f3d38"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" width="1300" height="820"/>
+  <text x="40" y="48" class="txt title">Cableado MVP del mini heliostato</text>
+  <text x="40" y="78" class="txt small">ESP32 + dos drivers L298N + motores DC con encoder + finales de carrera. GND comun obligatorio.</text>
+
+  <!-- Power -->
+  <rect x="45" y="125" width="210" height="95" class="power"/>
+  <text x="72" y="160" class="txt label">Fuente 12 V 3 A</text>
+  <text x="74" y="188" class="txt small">+12 V motores</text>
+  <text x="74" y="210" class="txt small">GND comun</text>
+
+  <rect x="45" y="285" width="210" height="90" class="power"/>
+  <text x="80" y="320" class="txt label">Buck XL4015</text>
+  <text x="72" y="348" class="txt small">12 V entrada</text>
+  <text x="72" y="368" class="txt small">5 V salida opcional</text>
+
+  <!-- ESP32 -->
+  <rect x="505" y="120" width="250" height="515" class="box"/>
+  <text x="590" y="155" class="txt label">ESP32</text>
+  <text x="532" y="195" class="txt pin">GPIO25 PWM AZ</text>
+  <text x="532" y="220" class="txt pin">GPIO26 IN1 AZ</text>
+  <text x="532" y="245" class="txt pin">GPIO27 IN2 AZ</text>
+  <text x="532" y="285" class="txt pin">GPIO14 PWM EL</text>
+  <text x="532" y="310" class="txt pin">GPIO12 IN1 EL</text>
+  <text x="532" y="335" class="txt pin">GPIO13 IN2 EL</text>
+  <text x="532" y="385" class="txt pin">GPIO34 ENC_A AZ</text>
+  <text x="532" y="410" class="txt pin">GPIO35 ENC_B AZ</text>
+  <text x="532" y="445" class="txt pin">GPIO36 ENC_A EL</text>
+  <text x="532" y="470" class="txt pin">GPIO39 ENC_B EL</text>
+  <text x="532" y="520" class="txt pin">GPIO32 HOME AZ</text>
+  <text x="532" y="545" class="txt pin">GPIO33 LIMIT AZ</text>
+  <text x="532" y="580" class="txt pin">GPIO18 HOME EL</text>
+  <text x="532" y="605" class="txt pin">GPIO19 LIMIT EL</text>
+
+  <!-- Drivers -->
+  <rect x="870" y="135" width="180" height="150" class="box"/>
+  <text x="902" y="168" class="txt label">L298N AZ</text>
+  <text x="895" y="198" class="txt small">ENA / IN1 / IN2</text>
+  <text x="895" y="222" class="txt small">+12 V / GND</text>
+  <text x="895" y="246" class="txt small">OUT1 / OUT2</text>
+
+  <rect x="870" y="345" width="180" height="150" class="box"/>
+  <text x="902" y="378" class="txt label">L298N EL</text>
+  <text x="895" y="408" class="txt small">ENA / IN1 / IN2</text>
+  <text x="895" y="432" class="txt small">+12 V / GND</text>
+  <text x="895" y="456" class="txt small">OUT1 / OUT2</text>
+
+  <!-- Motors -->
+  <rect x="1100" y="145" width="160" height="85" class="motor"/>
+  <text x="1125" y="180" class="txt label">Motor AZ</text>
+  <text x="1125" y="207" class="txt small">DC + encoder</text>
+
+  <rect x="1100" y="355" width="160" height="85" class="motor"/>
+  <text x="1125" y="390" class="txt label">Motor EL</text>
+  <text x="1125" y="417" class="txt small">DC + encoder</text>
+
+  <!-- Sensors -->
+  <rect x="855" y="560" width="185" height="95" class="sensor"/>
+  <text x="880" y="593" class="txt label">Finales AZ</text>
+  <text x="885" y="622" class="txt small">HOME + LIMIT</text>
+
+  <rect x="1070" y="560" width="185" height="95" class="sensor"/>
+  <text x="1095" y="593" class="txt label">Finales EL</text>
+  <text x="1100" y="622" class="txt small">HOME + LIMIT</text>
+
+  <!-- Power wires -->
+  <path class="p12" d="M255 160 C345 160, 765 160, 870 195"/>
+  <path class="p12" d="M255 160 C390 250, 770 370, 870 405"/>
+  <path class="p12" d="M150 220 L150 285"/>
+  <path class="gnd" d="M255 205 C370 250, 740 250, 870 228"/>
+  <path class="gnd" d="M255 205 C390 410, 750 470, 870 438"/>
+  <path class="gnd" d="M255 205 C340 600, 455 625, 505 625"/>
+  <path class="gnd" d="M255 205 C690 720, 1040 690, 1160 655"/>
+
+  <!-- Signals ESP to drivers -->
+  <path class="sig" d="M755 195 C805 195, 825 195, 870 195"/>
+  <path class="sig" d="M755 220 C805 220, 825 215, 870 215"/>
+  <path class="sig" d="M755 245 C805 245, 825 235, 870 235"/>
+
+  <path class="sig" d="M755 285 C815 315, 835 385, 870 405"/>
+  <path class="sig" d="M755 310 C810 335, 835 408, 870 425"/>
+  <path class="sig" d="M755 335 C810 355, 835 430, 870 445"/>
+
+  <!-- Driver to motors -->
+  <path class="wire" d="M1050 205 C1070 205, 1080 188, 1100 188"/>
+  <path class="wire" d="M1050 245 C1070 245, 1080 205, 1100 205"/>
+  <path class="wire" d="M1050 415 C1070 415, 1080 398, 1100 398"/>
+  <path class="wire" d="M1050 455 C1070 455, 1080 415, 1100 415"/>
+
+  <!-- Encoders back -->
+  <path class="enc" d="M1100 225 C1000 310, 850 375, 755 385"/>
+  <path class="enc" d="M1100 225 C1010 330, 850 405, 755 410"/>
+  <path class="enc" d="M1100 438 C1000 470, 850 445, 755 445"/>
+  <path class="enc" d="M1100 438 C1010 495, 850 475, 755 470"/>
+
+  <!-- Limit switches -->
+  <path class="sig" d="M855 610 C810 585, 785 530, 755 520"/>
+  <path class="sig" d="M855 635 C805 605, 785 550, 755 545"/>
+  <path class="sig" d="M1070 610 C935 620, 820 590, 755 580"/>
+  <path class="sig" d="M1070 635 C935 650, 820 615, 755 605"/>
+
+  <!-- Legend -->
+  <rect x="45" y="680" width="1215" height="95" class="box"/>
+  <line x1="80" y1="715" x2="150" y2="715" class="p12"/>
+  <text x="165" y="721" class="txt small">+12 V motores</text>
+  <line x1="320" y1="715" x2="390" y2="715" class="gnd"/>
+  <text x="405" y="721" class="txt small">GND comun</text>
+  <line x1="560" y1="715" x2="630" y2="715" class="sig"/>
+  <text x="645" y="721" class="txt small">Control / finales</text>
+  <line x1="820" y1="715" x2="890" y2="715" class="enc"/>
+  <text x="905" y="721" class="txt small">Encoder A/B</text>
+  <text x="80" y="752" class="txt small">Nota: los cables del motor deben ir separados de los cables del encoder. El ESP32 puede ir por USB durante pruebas.</text>
+</svg>

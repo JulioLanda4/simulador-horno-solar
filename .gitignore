@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+ENV/
+
+# Variables de entorno y secretos
+.env
+.env.*
+*.key
+*.pem
+secrets.*
+credentials.*
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+
+# Editores
+.vscode/
+.idea/
+
+# Respaldos locales
+backups/
+
+# Logs y temporales
+*.log
+*.tmp
+*.bak
+*.swp
+tmp/
+digital_twin/logs/*.csv
+
+# Datos o salidas generadas
+outputs/
+exports/
+results/
+
+# Archivos locales de Codex
+.codex-remote-attachments/
+
+# Copias y preferencias locales de CAD/EDA
+*.FCBak
+*.kicad_prl
+*-backups/

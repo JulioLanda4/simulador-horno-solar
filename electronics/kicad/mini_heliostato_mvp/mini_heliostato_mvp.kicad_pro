@@ -1,0 +1,23 @@
+{
+  "board": {
+    "design_settings": {}
+  },
+  "boards": [],
+  "cvpcb": {},
+  "erc": {},
+  "libraries": {},
+  "meta": {
+    "filename": "mini_heliostato_mvp.kicad_pro",
+    "version": 1
+  },
+  "net_settings": {},
+  "pcbnew": {},
+  "schematic": {},
+  "sheets": [
+    [
+      "root",
+      ""
+    ]
+  ],
+  "text_variables": {}
+}
