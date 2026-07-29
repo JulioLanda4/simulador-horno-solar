@@ -106,6 +106,107 @@ def v_unit(a: tuple[float, float, float]) -> tuple[float, float, float]:
     return (a[0] / n, a[1] / n, a[2] / n)
 
 
+def normalize(v: tuple[float, float, float]) -> tuple[float, float, float]:
+    """Devuelve el vector unitario asociado a ``v``.
+
+    Las componentes pueden pertenecer al marco global ``+x`` oeste, ``+y`` sur,
+    ``+z`` cenit o a cualquier marco cartesiano equivalente. Si la magnitud es
+    casi cero devuelve el vector cero, igual que la utilidad historica
+    :func:`v_unit` que se conserva por compatibilidad.
+    """
+    return v_unit(v)
+
+
+def angle_between(
+    a: tuple[float, float, float],
+    b: tuple[float, float, float],
+) -> float:
+    """Retorna en grados el menor angulo entre dos vectores no nulos."""
+    a_unit = normalize(a)
+    b_unit = normalize(b)
+    if v_norm(a_unit) < 1e-12 or v_norm(b_unit) < 1e-12:
+        raise ValueError("No se puede calcular un angulo con un vector nulo")
+    return math.acos(clamp(v_dot(a_unit, b_unit), -1.0, 1.0)) * RAD
+
+
+def reflect_vector(
+    incident_direction: tuple[float, float, float],
+    normal: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    """Calcula la direccion reflejada mediante la ley de reflexion.
+
+    ``incident_direction`` es la direccion de propagacion *hacia* el espejo.
+    En este proyecto el vector solar ``S`` apunta del heliostato al Sol, por lo
+    que debe usarse ``incident_direction = -S``. ``normal`` apunta hacia la cara
+    reflectante. El resultado unitario se expresa en el mismo marco global
+    ``+x`` oeste, ``+y`` sur, ``+z`` cenit.
+
+    Lanza ``ValueError`` si la direccion incidente o la normal son nulas.
+    """
+    incident = normalize(incident_direction)
+    normal_unit = normalize(normal)
+    if v_norm(incident) < 1e-12 or v_norm(normal_unit) < 1e-12:
+        raise ValueError("La direccion incidente y la normal deben ser no nulas")
+    return normalize(v_sub(incident, v_mul(normal_unit, 2.0 * v_dot(incident, normal_unit))))
+
+
+def compute_heliostat_normal(
+    sun_direction: tuple[float, float, float],
+    target_direction: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    """Calcula la normal ideal como bisectriz entre Sol y objetivo.
+
+    ``sun_direction`` apunta del heliostato hacia el Sol y ``target_direction``
+    apunta del heliostato hacia el target. Ambas direcciones se normalizan. La
+    bisectriz ``normalize(S + T)`` satisface la ley de reflexion cuando el rayo
+    incidente usa la convencion de propagacion ``-S``.
+
+    Lanza ``ValueError`` para vectores nulos o direcciones exactamente opuestas,
+    porque en esos casos la bisectriz no queda definida de forma unica.
+    """
+    sun_unit = normalize(sun_direction)
+    target_unit = normalize(target_direction)
+    if v_norm(sun_unit) < 1e-12 or v_norm(target_unit) < 1e-12:
+        raise ValueError("Las direcciones solar y objetivo deben ser no nulas")
+    bisector = v_add(sun_unit, target_unit)
+    if v_norm(bisector) < 1e-12:
+        raise ValueError("Sol y objetivo opuestos no definen una bisectriz unica")
+    return normalize(bisector)
+
+
+@dataclass(frozen=True)
+class ReflectionDiagnostics:
+    """Vectores y angulos que permiten verificar la ley de reflexion."""
+
+    incident_direction: tuple[float, float, float]
+    reflected_direction: tuple[float, float, float]
+    incidence_angle_deg: float
+    reflection_angle_deg: float
+    target_difference_deg: float
+
+
+def compute_reflection_diagnostics(
+    sun_direction: tuple[float, float, float],
+    normal: tuple[float, float, float],
+    target_direction: tuple[float, float, float],
+) -> ReflectionDiagnostics:
+    """Evalua reflexion real y diferencia respecto de la direccion objetivo."""
+    sun_unit = normalize(sun_direction)
+    normal_unit = normalize(normal)
+    target_unit = normalize(target_direction)
+    if min(v_norm(sun_unit), v_norm(normal_unit), v_norm(target_unit)) < 1e-12:
+        raise ValueError("Los diagnosticos requieren tres vectores no nulos")
+    incident = v_mul(sun_unit, -1.0)
+    reflected = reflect_vector(incident, normal_unit)
+    return ReflectionDiagnostics(
+        incident,
+        reflected,
+        angle_between(sun_unit, normal_unit),
+        angle_between(reflected, normal_unit),
+        angle_between(reflected, target_unit),
+    )
+
+
 def intersect_ray_plane(
     ray_origin: tuple[float, float, float],
     ray_direction: tuple[float, float, float],
@@ -515,6 +616,11 @@ class TwinState:
     tracking: bool = True
     automatic: bool = True
     free_mode: bool = False
+    show_sun_vector: bool = True
+    show_normal_vector: bool = True
+    show_reflected_vector: bool = True
+    show_target_direction: bool = True
+    show_target_line: bool = True
     running: bool = True
     iterations: int = 0
     az: AxisState = field(default_factory=lambda: AxisState("acim", limit_min=-95.0, limit_max=95.0))
@@ -538,7 +644,11 @@ class TwinState:
     spot_valid: bool = True
     spot_ray_t: float = 0.0
     spot_point: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    incident_direction: tuple[float, float, float] = (0.0, -1.0, 0.0)
     reflected_direction: tuple[float, float, float] = (0.0, 1.0, 0.0)
+    incidence_angle_deg: float = 0.0
+    reflection_angle_deg: float = 0.0
+    reflection_target_error_deg: float = 0.0
     target_plane_normal: tuple[float, float, float] = (0.0, 1.0, 0.0)
     target_u_axis: tuple[float, float, float] = (1.0, 0.0, 0.0)
     target_v_axis: tuple[float, float, float] = (0.0, 0.0, 1.0)
@@ -578,8 +688,11 @@ class TwinState:
             math.sin(alt),
         )
         self.target_vector = self.target_vector_scaled()
-        t_unit = v_unit(self.target_vector)
-        self.ideal_normal = v_unit(v_add(self.sun_vector, t_unit))
+        t_unit = normalize(self.target_vector)
+        try:
+            self.ideal_normal = compute_heliostat_normal(self.sun_vector, t_unit)
+        except ValueError:
+            self.ideal_normal = (0.0, 0.0, 0.0)
         acim, elev = angles_from_normal(self.ideal_normal)
         self.raw_target_acim = wrap_deg(acim + self.offset_acim + self.camera_offset_acim)
         self.raw_target_elev = elev + self.peralte + self.offset_ele + self.camera_offset_ele
@@ -600,11 +713,17 @@ class TwinState:
         positivo hacia el oeste; ``v`` es vertical y positivo hacia el cenit.
         Todas las posiciones y errores lineales se guardan en metros.
         """
-        incoming = v_mul(self.sun_vector, -1.0)
-        self.reflected_direction = v_unit(
-            v_sub(incoming, v_mul(self.actual_normal, 2.0 * v_dot(incoming, self.actual_normal)))
-        )
         try:
+            diagnostics = compute_reflection_diagnostics(
+                self.sun_vector,
+                self.actual_normal,
+                self.target_vector,
+            )
+            self.incident_direction = diagnostics.incident_direction
+            self.reflected_direction = diagnostics.reflected_direction
+            self.incidence_angle_deg = diagnostics.incidence_angle_deg
+            self.reflection_angle_deg = diagnostics.reflection_angle_deg
+            self.reflection_target_error_deg = diagnostics.target_difference_deg
             impact = compute_target_impact(
                 (0.0, 0.0, 0.0),
                 self.reflected_direction,
@@ -612,6 +731,11 @@ class TwinState:
                 self.target_tolerance_m,
             )
         except ValueError:
+            self.incident_direction = v_mul(normalize(self.sun_vector), -1.0)
+            self.reflected_direction = (float("nan"), float("nan"), float("nan"))
+            self.incidence_angle_deg = float("nan")
+            self.reflection_angle_deg = float("nan")
+            self.reflection_target_error_deg = float("nan")
             impact = None
         if impact is None or impact.point is None:
             self.spot_point = (float("nan"), float("nan"), float("nan"))
@@ -679,6 +803,9 @@ class TwinState:
                 "err_radial": self.spot_error_radial,
                 "spot_valid": self.spot_valid,
                 "spot": self.spot_point,
+                "incidence_deg": self.incidence_angle_deg,
+                "reflection_deg": self.reflection_angle_deg,
+                "reflection_target_deg": self.reflection_target_error_deg,
             }
         )
 
@@ -875,6 +1002,14 @@ class DigitalTwinApp:
         self.var("free_mode", self.state.free_mode)
         self.var("specific_time", not self.state.use_live_time)
         self.var("scale_to_model", self.state.scale_to_model)
+        for name in (
+            "show_sun_vector",
+            "show_normal_vector",
+            "show_reflected_vector",
+            "show_target_direction",
+            "show_target_line",
+        ):
+            self.var(name, getattr(self.state, name))
         self.var("method", self.state.method)
         self.var("view_mode", "Isometrica")
         self.var("mode_status", "MODO ACTIVO: MANUAL / MOVIMIENTO LIBRE")
@@ -944,6 +1079,7 @@ class DigitalTwinApp:
         self.build_motor_block(left)
         self.build_geometry_block(left)
         self.build_auto_block(left)
+        self.build_vector_block(left)
         self.build_calibration_block(left)
         self.build_status_block(left)
 
@@ -1088,6 +1224,24 @@ class DigitalTwinApp:
         grid.columnconfigure(1, weight=1)
         grid.columnconfigure(3, weight=1)
 
+    def build_vector_block(self, parent: ttk.Frame) -> None:
+        """Construye controles independientes de visibilidad para la vista 3D."""
+        frame = ttk.LabelFrame(parent, text="Vectores geometricos visibles", style="Block.TLabelframe")
+        frame.pack(fill="x", padx=10, pady=5)
+        grid = ttk.Frame(frame, style="Panel.TFrame")
+        grid.pack(fill="x", padx=8, pady=7)
+        controls = (
+            ("Solar incidente", "show_sun_vector", 0, 0),
+            ("Normal heliostato", "show_normal_vector", 0, 2),
+            ("Rayo reflejado", "show_reflected_vector", 1, 0),
+            ("Direccion objetivo", "show_target_direction", 1, 2),
+            ("Linea heliostato-target", "show_target_line", 2, 0),
+        )
+        for label, varname, row, col in controls:
+            self.add_switch(grid, label, varname, row=row, col=col)
+        for col in range(4):
+            grid.columnconfigure(col, weight=1)
+
     def build_calibration_block(self, parent: ttk.Frame) -> None:
         """Construye parametros de calibracion visual y de movimiento simulado.
 
@@ -1159,6 +1313,8 @@ class DigitalTwinApp:
             ("Counter Acim", "az_counts"),
             ("Impacto U/V mm", "spot"),
             ("Error angular", "angular_error"),
+            ("Incidencia / Reflexion", "optical_angles"),
+            ("Reflejado vs objetivo", "reflection_target_error"),
             ("Limites", "limit_status"),
             ("Estado motores", "motor_status"),
             ("Iteraciones", "iterations"),
@@ -1485,6 +1641,21 @@ class DigitalTwinApp:
             "zenith_deg": s.zenith,
             "altitude_deg": s.altitude,
             "solar_azimuth_deg": s.solar_azimuth,
+            "sun_x": s.sun_vector[0],
+            "sun_y": s.sun_vector[1],
+            "sun_z": s.sun_vector[2],
+            "incident_x": s.incident_direction[0],
+            "incident_y": s.incident_direction[1],
+            "incident_z": s.incident_direction[2],
+            "normal_x": s.actual_normal[0],
+            "normal_y": s.actual_normal[1],
+            "normal_z": s.actual_normal[2],
+            "reflected_x": s.reflected_direction[0],
+            "reflected_y": s.reflected_direction[1],
+            "reflected_z": s.reflected_direction[2],
+            "incidence_deg": s.incidence_angle_deg,
+            "reflection_deg": s.reflection_angle_deg,
+            "reflection_target_deg": s.reflection_target_error_deg,
             "rx_m": s.rx,
             "ry_m": s.ry,
             "rz_m": s.rz,
@@ -1521,6 +1692,31 @@ class DigitalTwinApp:
         s.zenith = float(sample["zenith_deg"])
         s.altitude = float(sample["altitude_deg"])
         s.solar_azimuth = float(sample["solar_azimuth_deg"])
+        s.sun_vector = (
+            float(sample.get("sun_x", s.sun_vector[0])),
+            float(sample.get("sun_y", s.sun_vector[1])),
+            float(sample.get("sun_z", s.sun_vector[2])),
+        )
+        s.incident_direction = (
+            float(sample.get("incident_x", s.incident_direction[0])),
+            float(sample.get("incident_y", s.incident_direction[1])),
+            float(sample.get("incident_z", s.incident_direction[2])),
+        )
+        s.actual_normal = (
+            float(sample.get("normal_x", s.actual_normal[0])),
+            float(sample.get("normal_y", s.actual_normal[1])),
+            float(sample.get("normal_z", s.actual_normal[2])),
+        )
+        s.reflected_direction = (
+            float(sample.get("reflected_x", s.reflected_direction[0])),
+            float(sample.get("reflected_y", s.reflected_direction[1])),
+            float(sample.get("reflected_z", s.reflected_direction[2])),
+        )
+        s.incidence_angle_deg = float(sample.get("incidence_deg", s.incidence_angle_deg))
+        s.reflection_angle_deg = float(sample.get("reflection_deg", s.reflection_angle_deg))
+        s.reflection_target_error_deg = float(
+            sample.get("reflection_target_deg", s.reflection_target_error_deg)
+        )
         s.az.counts = int(round(s.az.angle_deg * s.az.counts_per_degree))
         s.el.counts = int(round(s.el.angle_deg * s.el.counts_per_degree))
 
@@ -1646,6 +1842,16 @@ class DigitalTwinApp:
             if s.spot_valid
             else "SIN IMPACTO"
         )
+        optical_angles_text = (
+            f"{s.incidence_angle_deg:6.3f} / {s.reflection_angle_deg:6.3f} deg"
+            if math.isfinite(s.incidence_angle_deg) and math.isfinite(s.reflection_angle_deg)
+            else "NO DEFINIDO"
+        )
+        target_difference_text = (
+            f"{s.reflection_target_error_deg:8.4f} deg"
+            if math.isfinite(s.reflection_target_error_deg)
+            else "NO DEFINIDO"
+        )
         values = {
             "zenith": f"{s.zenith:8.4f}",
             "altitude": f"{s.altitude:8.4f}",
@@ -1658,6 +1864,8 @@ class DigitalTwinApp:
             "az_counts": f"{s.az.counts:d}",
             "spot": impact_text,
             "angular_error": f"{wrap_deg(s.az.target_deg - s.az.angle_deg):6.2f} / {s.el.target_deg - s.el.angle_deg:6.2f}",
+            "optical_angles": optical_angles_text,
+            "reflection_target_error": target_difference_text,
             "limit_status": limit_text,
             "motor_status": f"AZ {'ON' if s.az.motor_on else 'OFF'} | EL {'ON' if s.el.motor_on else 'OFF'}",
             "iterations": f"{s.iterations:d}",
@@ -1843,7 +2051,10 @@ class DigitalTwinApp:
         for k in (-0.05, 0.05):
             self.line3d(c, v_add(center, v_mul(u, k)), v_add(v_add(center, v_mul(u, k)), v_mul(v, 0.12)), "#b8c9d1", 1)
             self.line3d(c, v_add(center, v_mul(v, k)), v_add(v_add(center, v_mul(v, k)), v_mul(u, 0.12)), "#b8c9d1", 1)
-        self.line3d(c, center, v_add(center, v_mul(n, 0.18)), "#f8d447", 3)
+        if self.state.show_normal_vector:
+            normal_end = v_add(center, v_mul(n, 0.18))
+            self.line3d(c, center, normal_end, "#f8d447", 3)
+            self.text3d(c, v_add(normal_end, (0.0, 0.0, 0.025)), "Normal N", "#f8d447")
         if self.state.az.ina or self.state.az.inb:
             direction = "AZ +" if self.state.az.ina else "AZ -"
             c.create_text(24, 78, anchor="w", text=f"Movimiento {direction}", fill="#ffdf6e", font=("Segoe UI", 11, "bold"))
@@ -1893,25 +2104,39 @@ class DigitalTwinApp:
             top = v_add(target_center, v_mul(sx, leg * 0.7))
             self.line3d(c, base, top, "#8a8a8a", 3)
 
-        # Rayos: el punteado viene desde el Sol hacia el espejo; el solido va
-        # desde el espejo hacia el concentrador. El cono muestra tolerancia cdr.
+        # Vectores opticos con controles independientes para evitar saturacion.
         sun_start = v_add(center, v_mul(self.state.sun_vector, 0.35))
-        self.line3d(c, sun_start, center, "#ffbf4d", 3, dash=(5, 3))
+        if self.state.show_sun_vector:
+            self.line3d(c, sun_start, center, "#ff9f43", 3, dash=(5, 3))
+            self.text3d(c, v_add(sun_start, (0.0, 0.0, 0.035)), "Incidente -S", "#ffb765")
+
         reflected_end = target_center
         if self.state.spot_valid:
             reflected_end = v_add(self.state.spot_point, (0.0, 0.0, 0.12))
-        self.line3d(c, center, reflected_end, "#ffef6a", 3)
-        self.text3d(c, v_add(sun_start, (0.0, 0.0, 0.035)), "Sol", "#ffcf69")
-        self.text3d(c, v_add(v_add(center, v_mul(n, 0.18)), (0.0, 0.0, 0.025)), "Normal", "#f8d447")
+        elif all(math.isfinite(value) for value in self.state.reflected_direction):
+            reflected_end = v_add(center, v_mul(self.state.reflected_direction, 0.35))
+        if self.state.show_reflected_vector:
+            self.line3d(c, center, reflected_end, "#fff06a", 4)
+            self.text3d(c, v_add(reflected_end, (0.0, 0.0, 0.025)), "Reflejado", "#fff49b")
+
+        target_direction_end = v_add(center, v_mul(t_unit, 0.28))
+        if self.state.show_target_direction:
+            self.line3d(c, center, target_direction_end, "#58d6e7", 3)
+            self.text3d(c, v_add(target_direction_end, (0.0, 0.0, 0.025)), "Objetivo T", "#8ce8f2")
+        if self.state.show_target_line:
+            self.line3d(c, center, target_center, "#b9c6d3", 2, dash=(3, 5))
+            self.text3d(c, v_add(target_center, (0.0, 0.0, 0.035)), "Linea H-target", "#c8d3df")
+
         target_distance = max(0.05, v_norm(self.state.target_vector))
         cone_radius = clamp(target_distance * math.tan(max(0.0, self.state.cdr) * DEG) * self.state.uncertainty_gain, 0.003, 0.08)
-        for edge in (
-            v_add(target_center, v_mul(sx, cone_radius)),
-            v_add(target_center, v_mul(sx, -cone_radius)),
-            v_add(target_center, v_mul(sz, cone_radius)),
-            v_add(target_center, v_mul(sz, -cone_radius)),
-        ):
-            self.line3d(c, center, edge, "#fff4a8", 1, dash=(3, 4))
+        if self.state.show_target_line:
+            for edge in (
+                v_add(target_center, v_mul(sx, cone_radius)),
+                v_add(target_center, v_mul(sx, -cone_radius)),
+                v_add(target_center, v_mul(sz, cone_radius)),
+                v_add(target_center, v_mul(sz, -cone_radius)),
+            ):
+                self.line3d(c, center, edge, "#dce5ed", 1, dash=(3, 4))
         if all(math.isfinite(p) for p in self.state.spot_point):
             spot = v_add(self.state.spot_point, (0.0, 0.0, 0.12))
             px, py, _ = self.project(spot, w, h)
@@ -1930,6 +2155,7 @@ class DigitalTwinApp:
             f"Elev actual {self.state.el.angle_deg:6.2f} deg  -> {self.state.el.target_deg:6.2f} deg\n"
             f"{spot_info}\n"
             f"Sol: {sun_side} | Normal ideal: {normal_side}\n"
+            f"i/r {self.state.incidence_angle_deg:6.3f}/{self.state.reflection_angle_deg:6.3f} deg | R-T {self.state.reflection_target_error_deg:6.3f} deg\n"
             f"Vista: {self.vars['view_mode'].get()} | Concentrador: 18 facetas"
         )
         c.create_rectangle(w - 390, 18, w - 18, 172, fill="#172432", outline="#4f6f8d")
@@ -2213,11 +2439,16 @@ class DigitalTwinApp:
             font=("Segoe UI", 9),
         )
         s = self.state
+        target_direction = normalize(s.target_vector)
         vector_text = (
             f"S solar   = ({s.sun_vector[0]:+.3f}, {s.sun_vector[1]:+.3f}, {s.sun_vector[2]:+.3f})\n"
-            f"R target  = ({s.target_vector[0]:+.3f}, {s.target_vector[1]:+.3f}, {s.target_vector[2]:+.3f}) m\n"
+            f"I incidente=({s.incident_direction[0]:+.3f}, {s.incident_direction[1]:+.3f}, {s.incident_direction[2]:+.3f})\n"
+            f"T objetivo= ({target_direction[0]:+.3f}, {target_direction[1]:+.3f}, {target_direction[2]:+.3f})\n"
             f"N ideal   = ({s.ideal_normal[0]:+.3f}, {s.ideal_normal[1]:+.3f}, {s.ideal_normal[2]:+.3f})\n"
             f"N actual  = ({s.actual_normal[0]:+.3f}, {s.actual_normal[1]:+.3f}, {s.actual_normal[2]:+.3f})\n"
+            f"R reflejado=({s.reflected_direction[0]:+.3f}, {s.reflected_direction[1]:+.3f}, {s.reflected_direction[2]:+.3f})\n"
+            f"Angulos i/r = {s.incidence_angle_deg:.4f} / {s.reflection_angle_deg:.4f} deg\n"
+            f"Diferencia R-T = {s.reflection_target_error_deg:.5f} deg\n"
             f"Target crudo EL: {s.raw_target_elev:+.2f} deg | Peralte helio: {s.peralte:+.2f} deg\n"
             f"Impacto: {s.spot_status} | error angular: {s.spot_error_angular_deg:.4f} deg"
         )
@@ -2302,8 +2533,8 @@ class DigitalTwinApp:
 def run_self_test() -> None:
     """Prueba rapida sin abrir GUI.
 
-    Verifica el modelo completo y los casos esenciales del target virtual sin
-    abrir Tkinter: centro, signo horizontal y rayo paralelo al plano.
+    Verifica el modelo completo, los casos esenciales del target virtual y la
+    ley de reflexion sin abrir Tkinter.
     """
     state = TwinState()
     state.use_live_time = False
@@ -2336,6 +2567,15 @@ def run_self_test() -> None:
         normal,
     )
     assert parallel_point is None and parallel_t is None
+
+    sun_direction = normalize((-0.35, 0.72, 0.60))
+    target_direction = normalize((0.18, 0.97, -0.16))
+    ideal_normal = compute_heliostat_normal(sun_direction, target_direction)
+    optical = compute_reflection_diagnostics(sun_direction, ideal_normal, target_direction)
+    assert abs(v_norm(ideal_normal) - 1.0) < 1e-12
+    assert abs(v_norm(optical.reflected_direction) - 1.0) < 1e-12
+    assert abs(optical.incidence_angle_deg - optical.reflection_angle_deg) < 1e-10
+    assert optical.target_difference_deg < 1e-6
     print("self-test ok")
 
 
