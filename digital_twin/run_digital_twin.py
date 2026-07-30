@@ -23,6 +23,7 @@ import argparse
 import csv
 import datetime as _dt
 import math
+import time
 import tkinter as tk
 from collections import deque
 from dataclasses import dataclass, field
@@ -39,6 +40,21 @@ try:
     from digital_twin.correction_model import CorrectionConfig, CorrectionModel
 except ModuleNotFoundError:  # Permite ejecutar directamente este archivo .py.
     from correction_model import CorrectionConfig, CorrectionModel
+
+try:
+    from digital_twin.facet_model import (
+        Facet,
+        FacetRayResult,
+        build_compact_facets,
+        trace_facets,
+    )
+except ModuleNotFoundError:  # Permite ejecutar directamente este archivo .py.
+    from facet_model import (
+        Facet,
+        FacetRayResult,
+        build_compact_facets,
+        trace_facets,
+    )
 
 
 TAU = 2.0 * math.pi
@@ -680,6 +696,30 @@ class TwinState:
     drift_correction_el_deg: float = 0.0
     drift_correction_pending: bool = False
     drift_corrected_this_step: bool = False
+    facet_field_enabled: bool = False
+    facet_shape: str = "Cuadrada"
+    facet_count: int = 9
+    facet_rows: int = 3
+    facet_columns: int = 3
+    facet_spacing_m: float = 0.035
+    facet_gap_m: float = 0.003
+    facet_size_m: float = 0.030
+    facet_focal_distance_m: float = 0.250
+    facet_misaligned_id: str = "F5"
+    facet_horizontal_misalignment_deg: float = 0.0
+    facet_vertical_misalignment_deg: float = 0.0
+    facet_view_mode: str = "Resumen"
+    facet_active_ids: set[str] = field(
+        default_factory=lambda: {f"F{index}" for index in range(1, 10)}
+    )
+    facets: list[Facet] = field(default_factory=list)
+    facet_ray_results: list[FacetRayResult] = field(default_factory=list)
+    facet_focus: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    facet_receiver_normal: tuple[float, float, float] = (0.0, 1.0, 0.0)
+    facet_error_max_m: float = 0.0
+    facet_error_average_m: float = 0.0
+    facet_compute_ms: float = 0.0
+    _facet_previous_count: int = field(default=9, repr=False)
     motion_error_sample: MotionErrorSample = field(default_factory=MotionErrorSample)
     ideal_spot_u: float = 0.0
     ideal_spot_v: float = 0.0
@@ -944,6 +984,56 @@ class TwinState:
             self.corrected_spot_radial,
         ) = self._scenario_impact("Corregido")
 
+    def compute_facet_field(self) -> None:
+        """Construye y traza el concentrador 3x3 con un rayo por faceta."""
+        if not self.facet_field_enabled:
+            self.facets = []
+            self.facet_ray_results = []
+            self.facet_error_max_m = 0.0
+            self.facet_error_average_m = 0.0
+            self.facet_compute_ms = 0.0
+            return
+        started = time.perf_counter()
+        concentrator_center = self.scenario_target_vector(self.error_mode)
+        axis = v_unit(concentrator_center)
+        if v_norm(axis) < 1e-12:
+            self.facets = []
+            self.facet_ray_results = []
+            self.facet_error_max_m = float("nan")
+            self.facet_error_average_m = float("nan")
+            self.facet_compute_ms = (time.perf_counter() - started) * 1000.0
+            return
+        focal_distance = max(0.001, float(self.facet_focal_distance_m))
+        self.facet_focus = v_sub(concentrator_center, v_mul(axis, focal_distance))
+        self.facet_receiver_normal = axis
+        self.facets = build_compact_facets(
+            concentrator_center=concentrator_center,
+            focus=self.facet_focus,
+            count=self.facet_count,
+            shape=self.facet_shape,
+            size_m=max(0.001, float(self.facet_size_m)),
+            gap_m=max(0.0, float(self.facet_gap_m)),
+            focal_distance_m=focal_distance,
+            active_ids=set(self.facet_active_ids),
+            misaligned_facet_id=self.facet_misaligned_id,
+            horizontal_misalignment_deg=self.facet_horizontal_misalignment_deg,
+            vertical_misalignment_deg=self.facet_vertical_misalignment_deg,
+        )
+        self.facet_ray_results = trace_facets(
+            self.facets,
+            heliostat_origin=(0.0, 0.0, 0.0),
+            receiver_center=self.facet_focus,
+            receiver_normal=self.facet_receiver_normal,
+        )
+        errors = [
+            result.focus_error_m
+            for result in self.facet_ray_results
+            if math.isfinite(result.focus_error_m)
+        ]
+        self.facet_error_max_m = max(errors, default=0.0)
+        self.facet_error_average_m = sum(errors) / len(errors) if errors else 0.0
+        self.facet_compute_ms = (time.perf_counter() - started) * 1000.0
+
     def target_vector_scaled(self) -> tuple[float, float, float]:
         """Devuelve el vector R hacia el concentrador en escala real o maqueta."""
         if self.scale_to_model:
@@ -989,6 +1079,7 @@ class TwinState:
         self.actual_normal = self.scenario_normal(self.error_mode)
         self.compute_spot_error()
         self.compute_error_comparison()
+        self.compute_facet_field()
 
     def compute_spot_error(self) -> None:
         """Calcula el cruce real del rayo reflejado con el target virtual.
@@ -1155,6 +1246,13 @@ class TwinState:
                 "drift_correction_el_deg": self.drift_correction_el_deg,
                 "drift_correction_count": self.correction_model.update_count,
                 "drift_corrected": self.drift_corrected_this_step,
+                "facet_field_enabled": self.facet_field_enabled,
+                "facet_shape": self.facet_shape,
+                "facet_count": self.facet_count,
+                "facet_active_count": len(self.facet_ray_results),
+                "facet_error_max_m": self.facet_error_max_m,
+                "facet_error_average_m": self.facet_error_average_m,
+                "facet_compute_ms": self.facet_compute_ms,
                 "tracking": self.tracking,
                 "az": self.az.angle_deg,
                 "el": self.el.angle_deg,
@@ -1425,6 +1523,19 @@ class DigitalTwinApp:
                 f"correction_{correction_name}",
                 getattr(self.state.correction_config, correction_name),
             )
+        for facet_name in (
+            "facet_field_enabled",
+            "facet_shape",
+            "facet_count",
+            "facet_gap_m",
+            "facet_size_m",
+            "facet_focal_distance_m",
+            "facet_misaligned_id",
+            "facet_horizontal_misalignment_deg",
+            "facet_vertical_misalignment_deg",
+            "facet_view_mode",
+        ):
+            self.var(facet_name, getattr(self.state, facet_name))
         for name in (
             "show_sun_vector",
             "show_normal_vector",
@@ -1508,6 +1619,7 @@ class DigitalTwinApp:
         self.build_vector_block(left)
         self.build_error_block(left)
         self.build_correction_block(left)
+        self.build_facet_block(left)
         self.build_calibration_block(left)
         self.build_status_block(left)
 
@@ -1521,6 +1633,7 @@ class DigitalTwinApp:
         self.drift_canvas = tk.Canvas(notebook, bg="#f4f4f4", highlightthickness=0)
         self.error_canvas = tk.Canvas(notebook, bg="#f4f4f4", highlightthickness=0)
         self.correction_canvas = tk.Canvas(notebook, bg="#f4f4f4", highlightthickness=0)
+        self.facet_canvas = tk.Canvas(notebook, bg="#f4f4f4", highlightthickness=0)
         self.diagnostic_canvas = tk.Canvas(notebook, bg="#f4f4f4", highlightthickness=0)
         self.logic_canvas = tk.Canvas(notebook, bg="#f7f7f7", highlightthickness=0)
         self.log_canvas = tk.Canvas(notebook, bg="#f7f7f7", highlightthickness=0)
@@ -1530,6 +1643,7 @@ class DigitalTwinApp:
         notebook.add(self.drift_canvas, text="Deriva temporal")
         notebook.add(self.error_canvas, text="Comparacion de errores")
         notebook.add(self.correction_canvas, text="Correccion de deriva")
+        notebook.add(self.facet_canvas, text="Facetas / rayos")
         notebook.add(self.diagnostic_canvas, text="Diagnostico")
         notebook.add(self.logic_canvas, text="Flujo del gemelo")
         notebook.add(self.log_canvas, text="Eventos")
@@ -1902,6 +2016,102 @@ class DigitalTwinApp:
         for col in (1, 3):
             grid.columnconfigure(col, weight=1)
 
+    def build_facet_block(self, parent: ttk.Frame) -> None:
+        """Construye forma, cantidad y controles del concentrador facetado."""
+        frame = ttk.LabelFrame(parent, text="Concentrador facetado", style="Block.TLabelframe")
+        frame.pack(fill="x", padx=10, pady=5)
+        grid = ttk.Frame(frame, style="Panel.TFrame")
+        grid.pack(fill="x", padx=8, pady=7)
+        self.add_switch(grid, "Activar modelo", "facet_field_enabled", row=0, col=0)
+        ttk.OptionMenu(
+            grid,
+            self.vars["facet_shape"],
+            self.vars["facet_shape"].get(),
+            "Cuadrada",
+            "Circular",
+            "Hexagonal",
+            command=lambda _=None: self.apply_controls(),
+        ).grid(row=1, column=2, columnspan=2, sticky="ew", padx=2, pady=(7, 2))
+        ttk.Label(grid, text="Forma", style="Small.TLabel").grid(
+            row=1, column=0, sticky="w", padx=2, pady=(7, 2)
+        )
+        self.add_entry(grid, "Numero facetas", "facet_count", 2, 0)
+        self.add_entry(grid, "Tamano (m)", "facet_size_m", 2, 2)
+        self.add_entry(grid, "Separacion extra (m)", "facet_gap_m", 3, 0)
+        self.add_entry(grid, "Distancia focal (m)", "facet_focal_distance_m", 3, 2)
+        ttk.Label(
+            grid,
+            text="Selecciona una faceta por ID para desalinearla o cambiar su estado",
+            style="Small.TLabel",
+        ).grid(row=4, column=0, columnspan=4, sticky="w", padx=2, pady=(7, 2))
+        self.add_entry(grid, "ID (ej. F12)", "facet_misaligned_id", 5, 0)
+        self.add_entry(grid, "Desalin. horiz deg", "facet_horizontal_misalignment_deg", 5, 2)
+        self.add_entry(grid, "Desalin. vert deg", "facet_vertical_misalignment_deg", 6, 0)
+        selected_buttons = ttk.Frame(grid, style="Panel.TFrame")
+        selected_buttons.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(7, 2))
+        ttk.Button(
+            selected_buttons,
+            text="ACTIVAR SELECCIONADA",
+            style="Gold.TButton",
+            command=lambda: self.set_selected_facet_active(True),
+        ).pack(side="left", fill="x", expand=True, padx=(0, 3))
+        ttk.Button(
+            selected_buttons,
+            text="DESACTIVAR SELECCIONADA",
+            style="Manual.TButton",
+            command=lambda: self.set_selected_facet_active(False),
+        ).pack(side="left", fill="x", expand=True, padx=(3, 0))
+        buttons = ttk.Frame(grid, style="Panel.TFrame")
+        buttons.grid(row=8, column=0, columnspan=4, sticky="ew", pady=(3, 2))
+        ttk.Button(
+            buttons,
+            text="TODAS ON",
+            style="Gold.TButton",
+            command=lambda: self.set_all_facets_active(True),
+        ).pack(side="left", fill="x", expand=True, padx=(0, 3))
+        ttk.Button(
+            buttons,
+            text="TODAS OFF",
+            style="Manual.TButton",
+            command=lambda: self.set_all_facets_active(False),
+        ).pack(side="left", fill="x", expand=True, padx=(3, 0))
+        self.facet_status_label = ttk.Label(
+            grid,
+            text="Modelo de facetas desactivado",
+            style="Small.TLabel",
+            wraplength=450,
+            justify="left",
+        )
+        self.facet_status_label.grid(
+            row=9, column=0, columnspan=4, sticky="ew", padx=2, pady=(5, 2)
+        )
+        ttk.Label(
+            grid,
+            text=(
+                "Cuadradas: reticula compacta. Circulares y hexagonales: "
+                "empaquetamiento triangular centrado. Tamano = lado cuadrado, "
+                "diametro circular o ancho entre caras del hexagono."
+            ),
+            style="Small.TLabel",
+            wraplength=450,
+            justify="left",
+        ).grid(row=10, column=0, columnspan=4, sticky="ew", padx=2, pady=(2, 2))
+        ttk.Label(grid, text="Vista del esquema", style="Small.TLabel").grid(
+            row=11, column=0, sticky="w", padx=2, pady=(6, 2)
+        )
+        ttk.OptionMenu(
+            grid,
+            self.vars["facet_view_mode"],
+            self.vars["facet_view_mode"].get(),
+            "Resumen",
+            "Superior X-Y",
+            "Lateral Y-Z",
+            "3D isometrica",
+            command=lambda _=None: self.apply_controls(),
+        ).grid(row=11, column=1, columnspan=3, sticky="ew", padx=2, pady=(6, 2))
+        for col in (1, 3):
+            grid.columnconfigure(col, weight=1)
+
     def build_calibration_block(self, parent: ttk.Frame) -> None:
         """Construye parametros de calibracion visual y de movimiento simulado.
 
@@ -2224,6 +2434,32 @@ class DigitalTwinApp:
         self.state.reset_drift_correction()
         self.log_event("Correccion de deriva reiniciada")
 
+    def set_all_facets_active(self, active: bool) -> None:
+        """Activa o desactiva todas las contribuciones configuradas."""
+        self.apply_controls()
+        self.state.facet_active_ids = (
+            {f"F{index}" for index in range(1, self.state.facet_count + 1)}
+            if active
+            else set()
+        )
+        self.state.compute_geometry()
+        self.log_event("Todas las facetas activadas" if active else "Todas las facetas desactivadas")
+
+    def set_selected_facet_active(self, active: bool) -> None:
+        """Cambia el estado de la faceta escrita en el campo de seleccion."""
+        self.apply_controls()
+        facet_id = self.state.facet_misaligned_id.strip().upper()
+        valid_ids = {f"F{index}" for index in range(1, self.state.facet_count + 1)}
+        if facet_id not in valid_ids:
+            self.log_event(f"ID de faceta fuera de rango: {facet_id or '(vacio)'}")
+            return
+        if active:
+            self.state.facet_active_ids.add(facet_id)
+        else:
+            self.state.facet_active_ids.discard(facet_id)
+        self.state.compute_geometry()
+        self.log_event(f"{facet_id} {'activada' if active else 'desactivada'}")
+
     def apply_initial_datetime(self) -> None:
         """Aplica los campos de fecha/hora como nuevo origen de simulacion."""
         date_text = str(self.vars["date_text"].get()).strip()
@@ -2413,6 +2649,26 @@ class DigitalTwinApp:
             0.001, float(correction_config.camera_interval_s)
         )
 
+        new_facet_count = max(1, min(int(self.state.facet_count), 61))
+        self.vars["facet_count"].set(new_facet_count)
+        previous_facet_count = self.state._facet_previous_count
+        if new_facet_count > previous_facet_count:
+            self.state.facet_active_ids.update(
+                f"F{index}" for index in range(previous_facet_count + 1, new_facet_count + 1)
+            )
+        valid_facet_ids = {f"F{index}" for index in range(1, new_facet_count + 1)}
+        self.state.facet_active_ids.intersection_update(valid_facet_ids)
+        self.state.facet_count = new_facet_count
+        self.state._facet_previous_count = new_facet_count
+        if self.state.facet_shape not in ("Cuadrada", "Circular", "Hexagonal"):
+            self.state.facet_shape = "Cuadrada"
+        self.state.facet_gap_m = max(0.0, float(self.state.facet_gap_m))
+        self.state.facet_size_m = max(0.001, float(self.state.facet_size_m))
+        self.state.facet_focal_distance_m = max(
+            0.001, float(self.state.facet_focal_distance_m)
+        )
+        self.state.facet_misaligned_id = self.state.facet_misaligned_id.strip().upper() or "F1"
+
         # Variables propias de cada eje: velocidad por PWM, motor ON/OFF,
         # limites, escala de conteo y velocidad maxima.
         self.state.az.pwm = float(self.vars["az_pwm"].get())
@@ -2506,6 +2762,19 @@ class DigitalTwinApp:
             "drift_correction_el_deg": s.drift_correction_el_deg,
             "drift_correction_count": s.correction_model.update_count,
             "drift_corrected": s.drift_corrected_this_step,
+            "facet_field_enabled": s.facet_field_enabled,
+            "facet_view_mode": s.facet_view_mode,
+            "facet_shape": s.facet_shape,
+            "facet_count": s.facet_count,
+            "facet_size_m": s.facet_size_m,
+            "facet_gap_m": s.facet_gap_m,
+            "facet_focal_distance_m": s.facet_focal_distance_m,
+            "facet_selected_id": s.facet_misaligned_id,
+            "facet_active_ids": ",".join(sorted(s.facet_active_ids)),
+            "facet_active_count": len(s.facet_ray_results),
+            "facet_error_max_mm": s.facet_error_max_m * 1000.0,
+            "facet_error_average_mm": s.facet_error_average_m * 1000.0,
+            "facet_compute_ms": s.facet_compute_ms,
             "zenith_deg": s.zenith,
             "altitude_deg": s.altitude,
             "solar_azimuth_deg": s.solar_azimuth,
@@ -2602,6 +2871,25 @@ class DigitalTwinApp:
             sample.get("drift_correction_count", s.correction_model.update_count)
         )
         s.drift_corrected_this_step = bool(sample.get("drift_corrected", False))
+        s.facet_field_enabled = bool(sample.get("facet_field_enabled", s.facet_field_enabled))
+        s.facet_view_mode = str(sample.get("facet_view_mode", s.facet_view_mode))
+        s.facet_shape = str(sample.get("facet_shape", s.facet_shape))
+        s.facet_count = int(sample.get("facet_count", s.facet_count))
+        s._facet_previous_count = s.facet_count
+        s.facet_size_m = float(sample.get("facet_size_m", s.facet_size_m))
+        s.facet_gap_m = float(sample.get("facet_gap_m", s.facet_gap_m))
+        s.facet_focal_distance_m = float(
+            sample.get("facet_focal_distance_m", s.facet_focal_distance_m)
+        )
+        s.facet_misaligned_id = str(sample.get("facet_selected_id", s.facet_misaligned_id))
+        active_ids_text = str(sample.get("facet_active_ids", ""))
+        if active_ids_text:
+            s.facet_active_ids = {
+                facet_id.strip() for facet_id in active_ids_text.split(",") if facet_id.strip()
+            }
+        s.facet_error_max_m = float(sample.get("facet_error_max_mm", 0.0)) / 1000.0
+        s.facet_error_average_m = float(sample.get("facet_error_average_mm", 0.0)) / 1000.0
+        s.facet_compute_ms = float(sample.get("facet_compute_ms", 0.0))
         s.advance_solar_time = bool(sample.get("simulation_clock_running", s.advance_solar_time))
         s.solar_time_scale = float(sample.get("simulation_time_scale", s.solar_time_scale))
         s.simulation_step_s = float(sample.get("simulation_step_s", s.simulation_step_s))
@@ -2705,6 +2993,16 @@ class DigitalTwinApp:
             f"actualizaciones {self.state.correction_model.update_count} | {tolerance_status}"
         )
         self.correction_status_label.configure(text=status)
+        if self.state.facet_field_enabled:
+            facet_status = (
+                f"{self.state.facet_shape} | activas {len(self.state.facet_ray_results)}/{self.state.facet_count} | "
+                f"error max {self.state.facet_error_max_m * 1000.0:.3f} mm | "
+                f"prom {self.state.facet_error_average_m * 1000.0:.3f} mm | "
+                f"calculo {self.state.facet_compute_ms:.3f} ms"
+            )
+        else:
+            facet_status = "Modelo de facetas desactivado"
+        self.facet_status_label.configure(text=facet_status)
         self.update_mode_visuals()
 
     def update_mode_visuals(self) -> None:
@@ -2758,6 +3056,7 @@ class DigitalTwinApp:
         self.draw_drift_view()
         self.draw_error_view()
         self.draw_correction_view()
+        self.draw_facet_view()
         self.draw_diagnostic_view()
         self.draw_logic()
         self.draw_event_log()
@@ -3600,6 +3899,374 @@ class DigitalTwinApp:
                     x = left + (right - left) * idx / (len(hist) - 1)
                     c.create_line(x, top, x, bottom, fill="#d69e2e", width=1, dash=(3, 3))
 
+    def draw_facet_view(self) -> None:
+        """Dibuja facetas, rayos centrales e impactos sobre el receptor."""
+        c = self.facet_canvas
+        c.delete("all")
+        w, h = max(1, c.winfo_width()), max(1, c.winfo_height())
+        c.create_rectangle(0, 0, w, h, fill="#f4f4f4", outline="")
+        s = self.state
+        c.create_text(
+            24,
+            22,
+            anchor="w",
+            text="Concentrador facetado: un rayo central por faceta",
+            fill="#111111",
+            font=("Segoe UI", 15, "bold"),
+        )
+        summary = (
+            f"{s.facet_shape} | activas {len(s.facet_ray_results)}/{s.facet_count} | foco {s.facet_focal_distance_m:.3f} m | "
+            f"error max {s.facet_error_max_m * 1000.0:.3f} mm | "
+            f"calculo {s.facet_compute_ms:.3f} ms"
+        )
+        c.create_text(24, 52, anchor="w", text=summary, fill="#333333", font=("Consolas", 10))
+        if not s.facet_field_enabled:
+            c.create_text(
+                w / 2,
+                h / 2,
+                text="Activa 'Concentrador facetado' para calcular la distribucion seleccionada",
+                fill="#6b7280",
+                font=("Segoe UI", 13, "bold"),
+            )
+            return
+
+        schematic = (24, 82, int(w * 0.48), int(h * 0.60))
+        receiver = (int(w * 0.52), 82, w - 24, int(h * 0.60))
+        c.create_rectangle(*schematic, fill="#101821", outline="#718096")
+        c.create_rectangle(*receiver, fill="#fffdf5", outline="#8a7b58", width=2)
+        c.create_text(schematic[0] + 12, schematic[1] + 10, anchor="nw", text=f"Esquema: {s.facet_view_mode}", fill="#ffffff", font=("Segoe UI", 11, "bold"))
+        c.create_text(receiver[0] + 12, receiver[1] + 10, anchor="nw", text="Plano receptor / foco", fill="#111111", font=("Segoe UI", 11, "bold"))
+
+        result_by_id = {result.facet_id: result for result in s.facet_ray_results}
+        mirror_normal = s.actual_normal
+        if v_norm(mirror_normal) < 1e-9:
+            mirror_normal = normal_from_angles(s.az.angle_deg, s.el.angle_deg + s.peralte)
+        mirror_normal = v_unit(mirror_normal)
+        mirror_u = v_cross((0.0, 0.0, 1.0), mirror_normal)
+        if v_norm(mirror_u) < 1e-9:
+            mirror_u = (1.0, 0.0, 0.0)
+        mirror_u = v_unit(mirror_u)
+        mirror_v = v_unit(v_cross(mirror_normal, mirror_u))
+        mirror_half = max(0.025, s.mirror_size_m / 2.0)
+
+        def draw_facet_shape(
+            center_x: float,
+            center_y: float,
+            radius_px: float,
+            shape: str,
+            fill: str,
+        ) -> None:
+            radius_px = clamp(radius_px, 3.0, 11.0)
+            if shape == "Circular":
+                c.create_oval(
+                    center_x - radius_px,
+                    center_y - radius_px,
+                    center_x + radius_px,
+                    center_y + radius_px,
+                    fill=fill,
+                    outline="#ffffff",
+                )
+            elif shape == "Hexagonal":
+                points: list[float] = []
+                for vertex in range(6):
+                    angle = math.radians(-90.0 + vertex * 60.0)
+                    points.extend(
+                        [
+                            center_x + radius_px * math.cos(angle),
+                            center_y + radius_px * math.sin(angle),
+                        ]
+                    )
+                c.create_polygon(*points, fill=fill, outline="#ffffff")
+            else:
+                c.create_rectangle(
+                    center_x - radius_px,
+                    center_y - radius_px,
+                    center_x + radius_px,
+                    center_y + radius_px,
+                    fill=fill,
+                    outline="#ffffff",
+                )
+
+        if s.facet_view_mode == "Resumen":
+            helio_x = schematic[0] + 58
+            axis_y = (schematic[1] + schematic[3]) / 2.0
+            concentrator_x = schematic[2] - 58
+            focus_x = concentrator_x - (concentrator_x - helio_x) * 0.36
+            max_layout_extent = max(
+                [
+                    max(abs(facet.layout_u_m), abs(facet.layout_v_m))
+                    for facet in s.facets
+                ]
+                + [s.facet_size_m]
+            )
+            layout_scale = min(900.0, 72.0 / max(1e-6, max_layout_extent))
+            facet_radius = s.facet_size_m * layout_scale * 0.45
+            target_axis = v_unit(s.target_vector)
+            normal_axis_component = v_dot(mirror_normal, target_axis)
+            normal_vertical_component = mirror_normal[2]
+            mirror_direction_x = -normal_vertical_component
+            mirror_direction_y = -normal_axis_component
+            mirror_direction_norm = max(
+                1e-9,
+                math.hypot(mirror_direction_x, mirror_direction_y),
+            )
+            mirror_direction_x /= mirror_direction_norm
+            mirror_direction_y /= mirror_direction_norm
+            mirror_display_half = 62.0
+            mirror_screen_normal_x = -mirror_direction_y
+            mirror_screen_normal_y = mirror_direction_x
+            mirror_polygon = []
+            for along, across in (
+                (-mirror_display_half, -6.0),
+                (mirror_display_half, -6.0),
+                (mirror_display_half, 6.0),
+                (-mirror_display_half, 6.0),
+            ):
+                mirror_polygon.extend(
+                    [
+                        helio_x + mirror_direction_x * along + mirror_screen_normal_x * across,
+                        axis_y + mirror_direction_y * along + mirror_screen_normal_y * across,
+                    ]
+                )
+            c.create_polygon(*mirror_polygon, fill="#b8d8ff", outline="#ffffff", width=2)
+            c.create_line(helio_x, axis_y + 5, helio_x, axis_y + 84, fill="#94a3b8", width=3)
+            c.create_line(helio_x - 15, axis_y + 84, helio_x + 15, axis_y + 84, fill="#94a3b8", width=3)
+            c.create_text(
+                helio_x,
+                axis_y + 101,
+                text=f"Heliostato  AZ {s.az.angle_deg:.1f} / EL {s.el.angle_deg:.1f}",
+                fill="#dbeafe",
+                font=("Segoe UI", 8, "bold"),
+            )
+            for fraction in (-0.72, -0.36, 0.0, 0.36, 0.72):
+                ray_start_x = helio_x + mirror_direction_x * mirror_display_half * fraction
+                ray_start_y = axis_y + mirror_direction_y * mirror_display_half * fraction
+                c.create_line(
+                    ray_start_x,
+                    ray_start_y,
+                    ray_start_x + 56.0,
+                    ray_start_y,
+                    fill="#ffb454",
+                    width=2,
+                    arrow="last",
+                )
+            c.create_line(helio_x, axis_y, concentrator_x, axis_y, fill="#64748b", dash=(4, 4))
+            c.create_line(focus_x, axis_y - 55, focus_x, axis_y + 55, fill="#58d6e7", width=2)
+            c.create_text(focus_x, axis_y - 66, text="Receptor", fill="#8ce8f2", font=("Segoe UI", 9, "bold"))
+            for facet in s.facets:
+                facet_y = axis_y - facet.layout_v_m * layout_scale
+                facet_x = concentrator_x + facet.layout_u_m * layout_scale
+                color = "#d6b95f" if facet.active else "#5f6570"
+                draw_facet_shape(facet_x, facet_y, facet_radius, facet.shape, color)
+                if s.facet_count <= 18 or facet.id == s.facet_misaligned_id:
+                    c.create_text(facet_x + 9, facet_y, anchor="w", text=facet.id, fill="#ffffff", font=("Consolas", 8))
+                if not facet.active:
+                    continue
+                result = result_by_id.get(facet.id)
+                ray_color = "#66d9ef" if result and math.isfinite(result.focus_error_m) else "#ef4444"
+                impact_y = axis_y
+                if result and math.isfinite(result.impact_v_m):
+                    impact_y -= clamp(result.impact_v_m * 1200.0, -55.0, 55.0)
+                c.create_line(facet_x, facet_y, focus_x, impact_y, fill=ray_color, width=1)
+        else:
+            mirror_corners = [
+                v_add(v_mul(mirror_u, sign_u * mirror_half), v_mul(mirror_v, sign_v * mirror_half))
+                for sign_u, sign_v in ((-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0))
+            ]
+            world_points = [s.facet_focus, *mirror_corners]
+            world_points.extend(facet.center for facet in s.facets)
+            world_points.extend(
+                result.impact_point
+                for result in s.facet_ray_results
+                if result.impact_point is not None
+            )
+
+            def raw_projection(point: tuple[float, float, float]) -> tuple[float, float]:
+                x_m, y_m, z_m = point
+                if s.facet_view_mode == "Superior X-Y":
+                    return (y_m, x_m)
+                if s.facet_view_mode == "Lateral Y-Z":
+                    return (y_m, z_m)
+                return (x_m - 0.65 * y_m, z_m - 0.25 * x_m - 0.22 * y_m)
+
+            raw_points = [raw_projection(point) for point in world_points]
+            min_x = min(point[0] for point in raw_points)
+            max_x = max(point[0] for point in raw_points)
+            min_y = min(point[1] for point in raw_points)
+            max_y = max(point[1] for point in raw_points)
+            span_x = max(0.05, max_x - min_x)
+            span_y = max(0.05, max_y - min_y)
+            usable_w = max(10.0, schematic[2] - schematic[0] - 80.0)
+            usable_h = max(10.0, schematic[3] - schematic[1] - 72.0)
+            projection_scale = min(usable_w / span_x, usable_h / span_y)
+            middle_x = (min_x + max_x) / 2.0
+            middle_y = (min_y + max_y) / 2.0
+            screen_cx = (schematic[0] + schematic[2]) / 2.0
+            screen_cy = (schematic[1] + schematic[3]) / 2.0 + 8.0
+
+            def project_facet(point: tuple[float, float, float]) -> tuple[float, float]:
+                projected_x, projected_y = raw_projection(point)
+                return (
+                    screen_cx + (projected_x - middle_x) * projection_scale,
+                    screen_cy - (projected_y - middle_y) * projection_scale,
+                )
+
+            focus_px, focus_py = project_facet(s.facet_focus)
+            mirror_polygon: list[float] = []
+            for corner in mirror_corners:
+                corner_x, corner_y = project_facet(corner)
+                mirror_polygon.extend([corner_x, corner_y])
+            c.create_polygon(*mirror_polygon, fill="#8fc5ff", outline="#ffffff", width=2)
+            mirror_center_x, mirror_center_y = project_facet((0.0, 0.0, 0.0))
+            c.create_line(
+                mirror_center_x,
+                mirror_center_y + 5,
+                mirror_center_x,
+                mirror_center_y + 28,
+                fill="#94a3b8",
+                width=3,
+            )
+            c.create_line(
+                mirror_center_x - 16,
+                mirror_center_y + 28,
+                mirror_center_x + 16,
+                mirror_center_y + 28,
+                fill="#94a3b8",
+                width=3,
+            )
+            normal_tip_x, normal_tip_y = project_facet(v_mul(mirror_normal, mirror_half * 0.8))
+            c.create_line(
+                mirror_center_x,
+                mirror_center_y,
+                normal_tip_x,
+                normal_tip_y,
+                fill="#f472b6",
+                width=2,
+                arrow="last",
+            )
+            c.create_text(
+                mirror_center_x,
+                mirror_center_y + 18,
+                text=f"Heliostato  AZ {s.az.angle_deg:.1f} / EL {s.el.angle_deg:.1f}",
+                fill="#dbeafe",
+                font=("Segoe UI", 8, "bold"),
+            )
+            shared_incident = (
+                s.facets[0].incident_direction
+                if s.facets and s.facets[0].incident_direction is not None
+                else v_unit(s.target_vector)
+            )
+            for fraction_u, fraction_v in (
+                (-0.55, -0.45),
+                (0.0, -0.45),
+                (0.55, -0.45),
+                (-0.55, 0.45),
+                (0.0, 0.45),
+                (0.55, 0.45),
+            ):
+                ray_start = v_add(
+                    v_mul(mirror_u, mirror_half * fraction_u),
+                    v_mul(mirror_v, mirror_half * fraction_v),
+                )
+                ray_end = v_add(ray_start, v_mul(shared_incident, 0.075))
+                ray_start_x, ray_start_y = project_facet(ray_start)
+                ray_end_x, ray_end_y = project_facet(ray_end)
+                c.create_line(
+                    ray_start_x,
+                    ray_start_y,
+                    ray_end_x,
+                    ray_end_y,
+                    fill="#ffb454",
+                    width=2,
+                    arrow="last",
+                )
+            c.create_oval(focus_px - 7, focus_py - 7, focus_px + 7, focus_py + 7, fill="#58d6e7", outline="#ffffff")
+            c.create_text(focus_px, focus_py - 17, text="Foco", fill="#8ce8f2", font=("Segoe UI", 9, "bold"))
+            for facet in s.facets:
+                facet_px, facet_py = project_facet(facet.center)
+                color = "#d6b95f" if facet.active else "#5f6570"
+                draw_facet_shape(
+                    facet_px,
+                    facet_py,
+                    facet.size * projection_scale * 0.42,
+                    facet.shape,
+                    color,
+                )
+                if s.facet_count <= 18 or facet.id == s.facet_misaligned_id:
+                    c.create_text(facet_px + 7, facet_py - 7, anchor="w", text=facet.id, fill="#ffffff", font=("Consolas", 7))
+                normal_end = v_add(facet.center, v_mul(facet.normal, 0.035))
+                normal_px, normal_py = project_facet(normal_end)
+                c.create_line(facet_px, facet_py, normal_px, normal_py, fill="#f472b6", width=2)
+                if not facet.active:
+                    continue
+                result = result_by_id.get(facet.id)
+                if result is not None:
+                    endpoint = result.impact_point
+                    if endpoint is None:
+                        endpoint = v_add(facet.center, v_mul(result.reflected_direction, s.facet_focal_distance_m))
+                    impact_px, impact_py = project_facet(endpoint)
+                    ray_color = "#66d9ef" if math.isfinite(result.focus_error_m) else "#ef4444"
+                    c.create_line(facet_px, facet_py, impact_px, impact_py, fill=ray_color, width=1)
+            axes_label = {
+                "Superior X-Y": "horizontal y sur / vertical x oeste",
+                "Lateral Y-Z": "y sur / z cenit",
+                "3D isometrica": "3D: x oeste, y sur, z cenit",
+            }.get(s.facet_view_mode, "")
+            c.create_text(schematic[0] + 12, schematic[3] - 14, anchor="sw", text="n rosa | incidente naranja | reflejado cian | " + axes_label, fill="#dbeafe", font=("Segoe UI", 8))
+
+        receiver_cx = (receiver[0] + receiver[2]) / 2.0
+        receiver_cy = (receiver[1] + receiver[3]) / 2.0
+        half_pixels = max(60.0, min((receiver[2] - receiver[0]) * 0.37, (receiver[3] - receiver[1]) * 0.35))
+        half_range_m = max(0.005, s.facet_error_max_m * 1.25)
+        pixels_per_m = half_pixels / half_range_m
+        c.create_line(receiver_cx - half_pixels, receiver_cy, receiver_cx + half_pixels, receiver_cy, fill="#a89b78")
+        c.create_line(receiver_cx, receiver_cy - half_pixels, receiver_cx, receiver_cy + half_pixels, fill="#a89b78")
+        c.create_oval(receiver_cx - 5, receiver_cy - 5, receiver_cx + 5, receiver_cy + 5, outline="#16883f", width=2)
+        for result in s.facet_ray_results:
+            if not (math.isfinite(result.impact_u_m) and math.isfinite(result.impact_v_m)):
+                continue
+            px = clamp(receiver_cx + result.impact_u_m * pixels_per_m, receiver_cx - half_pixels, receiver_cx + half_pixels)
+            py = clamp(receiver_cy - result.impact_v_m * pixels_per_m, receiver_cy - half_pixels, receiver_cy + half_pixels)
+            color = "#2563eb" if result.focus_error_m < 1e-6 else "#d62828"
+            c.create_oval(px - 5, py - 5, px + 5, py + 5, fill=color, outline="#ffffff")
+            if s.facet_count <= 18 or result.facet_id == s.facet_misaligned_id:
+                c.create_text(px + 7, py - 7, anchor="w", text=result.facet_id, fill=color, font=("Consolas", 8, "bold"))
+        c.create_text(receiver_cx, receiver[3] - 14, text=f"u oeste + / v cenit + | escala +/- {half_range_m * 1000.0:.1f} mm", fill="#333333", font=("Segoe UI", 9))
+
+        table_top = int(h * 0.64)
+        c.create_text(24, table_top, anchor="w", text="Resultados por faceta", fill="#111111", font=("Segoe UI", 12, "bold"))
+        visible_facets = s.facets[:18]
+        rows_per_column = 6
+        for index, facet in enumerate(visible_facets):
+            column = index // rows_per_column
+            row = index % rows_per_column
+            x = 24 + column * (w * 0.325)
+            y = table_top + 32 + row * 33
+            result = result_by_id.get(facet.id)
+            if not facet.active:
+                detail = "INACTIVA - sin contribucion"
+                color = "#6b7280"
+            elif result is None or not math.isfinite(result.focus_error_m):
+                detail = "sin cruce con receptor"
+                color = "#b91c1c"
+            else:
+                detail = (
+                    f"u {result.impact_u_m * 1000.0:+8.3f} mm | "
+                    f"v {result.impact_v_m * 1000.0:+8.3f} mm | "
+                    f"error {result.focus_error_m * 1000.0:8.3f} mm"
+                )
+                color = "#16883f" if result.focus_error_m < 1e-6 else "#b91c1c"
+            c.create_text(x, y, anchor="w", text=f"{facet.id}: {detail}", fill=color, font=("Consolas", 9))
+        if len(s.facets) > len(visible_facets):
+            c.create_text(
+                w - 24,
+                table_top,
+                anchor="e",
+                text=f"Se muestran 18 de {len(s.facets)}; todos los impactos permanecen en la grafica",
+                fill="#6b7280",
+                font=("Segoe UI", 9),
+            )
+
     def draw_diagnostic_view(self) -> None:
         """Dibuja diagnostico numerico de errores, motores, vectores y alertas."""
         c = self.diagnostic_canvas
@@ -3692,7 +4359,7 @@ class DigitalTwinApp:
             ("Normal ideal", "N = unit(S + unit(R))\nAcim/Elev del heliostato"),
             ("Calibracion", "peralte, offsets, cdr\nlimites y conteos"),
             ("Motor simulado", "PWM por perilla\nencoder y limites\nmovimiento fluido"),
-            ("Concentrador", "18 facetas\nspot y error sobre pantalla"),
+            ("Concentrador", "forma y cantidad configurables\nun rayo central por faceta"),
             ("Alertas", "info, advertencia\ncritica"),
             ("Gemelo visual", "heliostato + concentrador\ncono cdr y rayos"),
             ("Datos", "muestras de sesion\nreplay y CSV"),
