@@ -594,6 +594,8 @@ class TwinState:
     method: str = "D&B"
     use_live_time: bool = True
     simulated_time: _dt.datetime = field(default_factory=_dt.datetime.now)
+    advance_solar_time: bool = True
+    solar_time_scale: float = 60.0
     rx: float = 0.0
     ry: float = 5.55
     rz: float = -0.40
@@ -656,7 +658,27 @@ class TwinState:
     target_vector: tuple[float, float, float] = (0.0, 1.0, 0.0)
     ideal_normal: tuple[float, float, float] = (0.0, 1.0, 0.0)
     actual_normal: tuple[float, float, float] = (0.0, 1.0, 0.0)
+    history_limit: int = 720
+    seconds_since_last_correction: float = 0.0
+    correction_count: int = 0
+    _last_tracking_state: bool = field(default=True, repr=False)
     history: deque = field(default_factory=lambda: deque(maxlen=720))
+
+    def set_history_limit(self, limit: int) -> None:
+        """Cambia el limite conservando las muestras mas recientes."""
+        bounded_limit = max(2, min(int(limit), 20000))
+        self.history_limit = bounded_limit
+        if self.history.maxlen != bounded_limit:
+            self.history = deque(self.history, maxlen=bounded_limit)
+
+    def clear_history(self) -> None:
+        """Elimina la trayectoria acumulada sin alterar el estado fisico."""
+        self.history.clear()
+
+    def mark_correction(self) -> None:
+        """Registra una actuacion de los ejes y reinicia su cronometro."""
+        self.seconds_since_last_correction = 0.0
+        self.correction_count += 1
 
     def target_vector_scaled(self) -> tuple[float, float, float]:
         """Devuelve el vector R hacia el concentrador en escala real o maqueta."""
@@ -771,6 +793,19 @@ class TwinState:
         """
         if not self.running:
             return
+        dt = max(0.0, float(dt))
+        solar_elapsed_s = dt
+        if not self.use_live_time and self.advance_solar_time:
+            solar_elapsed_s = dt * max(0.0, self.solar_time_scale)
+            self.simulated_time += _dt.timedelta(seconds=solar_elapsed_s)
+
+        # Al apagar seguimiento se congela la pose mecanica, pero el reloj y
+        # la posicion solar siguen avanzando. Este desacoplamiento produce la
+        # deriva fisica del rayo reflejado sobre el target.
+        if self._last_tracking_state and not self.tracking:
+            self.seconds_since_last_correction = 0.0
+        self._last_tracking_state = self.tracking
+
         self.compute_geometry()
         if target_override:
             self.az.target_deg = target_override[0]
@@ -778,20 +813,36 @@ class TwinState:
         else:
             self.az.target_deg = self.target_acim
             self.el.target_deg = self.target_elev
+        previous_az = self.az.angle_deg
+        previous_el = self.el.angle_deg
         if self.automatic and (self.tracking or target_override is not None) and not self.free_mode:
             self.az.update_closed_loop(dt, self.cdr)
             self.el.update_closed_loop(dt, self.cdr)
         else:
             self.az.ina = self.az.inb = self.el.ina = self.el.inb = 0
+        axes_moved = (
+            abs(self.az.angle_deg - previous_az) > 1e-9
+            or abs(self.el.angle_deg - previous_el) > 1e-9
+        )
+        if axes_moved:
+            self.mark_correction()
+        else:
+            self.seconds_since_last_correction += solar_elapsed_s
         # Los motores pueden cambiar la normal durante este mismo paso. El
         # impacto se vuelve a calcular para que la pantalla no lleve un ciclo de
         # retraso respecto de los angulos mostrados.
         self.actual_normal = normal_from_angles(self.az.angle_deg, self.el.angle_deg + self.peralte)
         self.compute_spot_error()
         self.iterations += 1
+        self.set_history_limit(self.history_limit)
         self.history.append(
             {
                 "t": self.iterations,
+                "solar_time": (
+                    _dt.datetime.now() if self.use_live_time else self.simulated_time
+                ).isoformat(timespec="milliseconds"),
+                "elapsed_since_correction_s": self.seconds_since_last_correction,
+                "tracking": self.tracking,
                 "az": self.az.angle_deg,
                 "el": self.el.angle_deg,
                 "az_target": self.az.target_deg,
@@ -938,6 +989,9 @@ class DigitalTwinApp:
         self.replay_index = 0
         self.last_status_label = ""
         self.invalid_time_text = ""
+        self.last_time_input: tuple[str, str] | None = None
+        self.last_specific_time_enabled = False
+        self.last_tracking_enabled = self.state.tracking
         self.state.automatic = False
         self.state.free_mode = True
         self.set_home_pose_instant()
@@ -1001,6 +1055,7 @@ class DigitalTwinApp:
         self.var("automatic", self.state.automatic)
         self.var("free_mode", self.state.free_mode)
         self.var("specific_time", not self.state.use_live_time)
+        self.var("advance_solar_time", self.state.advance_solar_time)
         self.var("scale_to_model", self.state.scale_to_model)
         for name in (
             "show_sun_vector",
@@ -1028,6 +1083,7 @@ class DigitalTwinApp:
             "camera_offset_acim",
             "cdr",
             "delay_s",
+            "solar_time_scale",
             "target_scale_m",
             "target_tolerance_m",
             "mirror_size_m",
@@ -1038,6 +1094,7 @@ class DigitalTwinApp:
             "uncertainty_gain",
         ):
             self.var(name, getattr(self.state, name))
+        self.var("history_limit", self.state.history_limit)
         self.var("az_limit_min", self.state.az.limit_min)
         self.var("az_limit_max", self.state.az.limit_max)
         self.var("el_limit_min", self.state.el.limit_min)
@@ -1090,12 +1147,14 @@ class DigitalTwinApp:
         self.scene_canvas = tk.Canvas(notebook, bg="#101821", highlightthickness=0)
         self.receiver_canvas = tk.Canvas(notebook, bg="#f4f4f4", highlightthickness=0)
         self.solar_canvas = tk.Canvas(notebook, bg="#f4f4f4", highlightthickness=0)
+        self.drift_canvas = tk.Canvas(notebook, bg="#f4f4f4", highlightthickness=0)
         self.diagnostic_canvas = tk.Canvas(notebook, bg="#f4f4f4", highlightthickness=0)
         self.logic_canvas = tk.Canvas(notebook, bg="#f7f7f7", highlightthickness=0)
         self.log_canvas = tk.Canvas(notebook, bg="#f7f7f7", highlightthickness=0)
         notebook.add(self.scene_canvas, text="Gemelo 3D")
         notebook.add(self.receiver_canvas, text="Pantalla / spot")
         notebook.add(self.solar_canvas, text="Trayectoria solar")
+        notebook.add(self.drift_canvas, text="Deriva temporal")
         notebook.add(self.diagnostic_canvas, text="Diagnostico")
         notebook.add(self.logic_canvas, text="Flujo del gemelo")
         notebook.add(self.log_canvas, text="Eventos")
@@ -1126,8 +1185,13 @@ class DigitalTwinApp:
         date_row.columnconfigure(3, weight=1)
         ttk.Label(
             frame,
-            text="Fecha especifica ON usa estos campos; OFF usa fecha y hora actuales.",
+            text=(
+                "Fecha especifica ON inicia en estos campos. Con 'Avanzar tiempo solar' "
+                "el reloj continua desde ese instante."
+            ),
             style="Small.TLabel",
+            wraplength=450,
+            justify="left",
         ).pack(anchor="w", padx=12, pady=(0, 8))
         for i in range(3):
             row.columnconfigure(i, weight=1)
@@ -1208,9 +1272,18 @@ class DigitalTwinApp:
         grid.pack(fill="x", padx=8, pady=7)
         self.add_switch(grid, "Seguimiento", "tracking", row=0, col=0)
         self.add_switch(grid, "Escalar R a maqueta", "scale_to_model", row=0, col=2)
-        self.add_entry(grid, "Consideracion (+/- cdr)", "cdr", 1, 0)
-        self.add_entry(grid, "Refresco (s)", "delay_s", 1, 2)
-        ttk.Label(grid, text="Vista 3D", style="Small.TLabel").grid(row=2, column=0, sticky="w", pady=2, padx=2)
+        self.add_switch(grid, "Avanzar tiempo solar", "advance_solar_time", row=1, col=0)
+        self.add_entry(grid, "Escala de tiempo (x)", "solar_time_scale", 1, 2)
+        self.add_entry(grid, "Consideracion (+/- cdr)", "cdr", 2, 0)
+        self.add_entry(grid, "Refresco (s)", "delay_s", 2, 2)
+        self.add_entry(grid, "Limite historial", "history_limit", 3, 0)
+        ttk.Button(
+            grid,
+            text="Limpiar trayectoria",
+            style="Gold.TButton",
+            command=self.clear_spot_history,
+        ).grid(row=3, column=2, columnspan=2, sticky="ew", padx=4, pady=3)
+        ttk.Label(grid, text="Vista 3D", style="Small.TLabel").grid(row=4, column=0, sticky="w", pady=2, padx=2)
         ttk.OptionMenu(
             grid,
             self.vars["view_mode"],
@@ -1220,7 +1293,7 @@ class DigitalTwinApp:
             "Lateral",
             "Superior",
             command=lambda _=None: self.apply_controls(),
-        ).grid(row=2, column=1, sticky="ew", pady=2, padx=2)
+        ).grid(row=4, column=1, sticky="ew", pady=2, padx=2)
         grid.columnconfigure(1, weight=1)
         grid.columnconfigure(3, weight=1)
 
@@ -1317,6 +1390,8 @@ class DigitalTwinApp:
             ("Reflejado vs objetivo", "reflection_target_error"),
             ("Limites", "limit_status"),
             ("Estado motores", "motor_status"),
+            ("Desde ultima correccion", "correction_elapsed"),
+            ("Historial deriva", "history_status"),
             ("Iteraciones", "iterations"),
         ]
         for row, (label, key) in enumerate(labels):
@@ -1514,6 +1589,12 @@ class DigitalTwinApp:
         self.state.iterations = 0
         self.log_event("Reset de iteraciones y retorno a home")
 
+    def clear_spot_history(self) -> None:
+        """Borra la trayectoria y las curvas de deriva acumuladas."""
+        removed = len(self.state.history)
+        self.state.clear_history()
+        self.log_event(f"Trayectoria limpiada ({removed} muestras)")
+
     def toggle_run(self) -> None:
         """Pausa o reanuda la simulacion sin cerrar la interfaz."""
         self.state.running = not self.state.running
@@ -1569,12 +1650,16 @@ class DigitalTwinApp:
         # Metodo solar y fecha/hora activa. Si "Fecha especifica" esta OFF,
         # siempre se usa la hora real del sistema.
         self.state.method = str(self.vars["method"].get())
-        self.state.use_live_time = not bool(self.vars["specific_time"].get())
+        specific_time_enabled = bool(self.vars["specific_time"].get())
+        self.state.use_live_time = not specific_time_enabled
         if not self.state.use_live_time:
             try:
                 date_text = str(self.vars["date_text"].get()).strip()
                 time_text = str(self.vars["time_text"].get()).strip()
-                self.state.simulated_time = _dt.datetime.fromisoformat(f"{date_text}T{time_text}")
+                time_input = (date_text, time_text)
+                if time_input != self.last_time_input or not self.last_specific_time_enabled:
+                    self.state.simulated_time = _dt.datetime.fromisoformat(f"{date_text}T{time_text}")
+                    self.last_time_input = time_input
                 if self.invalid_time_text:
                     self.log_event("Fecha especifica valida restaurada")
                 self.invalid_time_text = ""
@@ -1584,6 +1669,15 @@ class DigitalTwinApp:
                 self.invalid_time_text = "Fecha/hora especifica invalida"
         else:
             self.invalid_time_text = ""
+        self.last_specific_time_enabled = specific_time_enabled
+
+        tracking_enabled = bool(self.state.tracking)
+        if tracking_enabled != self.last_tracking_enabled:
+            if tracking_enabled:
+                self.log_event("Seguimiento reanudado")
+            else:
+                self.log_event("Seguimiento detenido: pose mecanica congelada")
+            self.last_tracking_enabled = tracking_enabled
 
         # Variables propias de cada eje: velocidad por PWM, motor ON/OFF,
         # limites, escala de conteo y velocidad maxima.
@@ -1607,6 +1701,8 @@ class DigitalTwinApp:
         # Saneamiento de parametros para evitar valores negativos o imposibles.
         self.state.cdr = max(0.0, float(self.state.cdr))
         self.state.delay_s = max(0.01, float(self.state.delay_s))
+        self.state.solar_time_scale = max(0.0, min(float(self.state.solar_time_scale), 3600.0))
+        self.state.set_history_limit(int(self.state.history_limit))
         self.state.target_scale_m = max(0.001, float(self.state.target_scale_m))
         self.state.target_tolerance_m = max(0.0, float(self.state.target_tolerance_m))
         self.state.mirror_size_m = max(0.05, float(self.state.mirror_size_m))
@@ -1638,6 +1734,9 @@ class DigitalTwinApp:
             "spot_angular_error_deg": s.spot_error_angular_deg,
             "spot_status": s.spot_status,
             "spot_valid": s.spot_valid,
+            "tracking": s.tracking,
+            "elapsed_since_correction_s": s.seconds_since_last_correction,
+            "correction_count": s.correction_count,
             "zenith_deg": s.zenith,
             "altitude_deg": s.altitude,
             "solar_azimuth_deg": s.solar_azimuth,
@@ -1689,6 +1788,11 @@ class DigitalTwinApp:
         s.spot_error_angular_deg = float(sample.get("spot_angular_error_deg", 0.0))
         s.spot_status = str(sample.get("spot_status", classify_target_error(s.spot_error_radial, s.target_tolerance_m)))
         s.spot_valid = bool(sample.get("spot_valid", True))
+        s.tracking = bool(sample.get("tracking", s.tracking))
+        s.seconds_since_last_correction = float(
+            sample.get("elapsed_since_correction_s", s.seconds_since_last_correction)
+        )
+        s.correction_count = int(sample.get("correction_count", s.correction_count))
         s.zenith = float(sample["zenith_deg"])
         s.altitude = float(sample["altitude_deg"])
         s.solar_azimuth = float(sample["solar_azimuth_deg"])
@@ -1820,6 +1924,7 @@ class DigitalTwinApp:
         self.draw_scene()
         self.draw_receiver_view()
         self.draw_solar_path()
+        self.draw_drift_view()
         self.draw_diagnostic_view()
         self.draw_logic()
         self.draw_event_log()
@@ -1868,6 +1973,8 @@ class DigitalTwinApp:
             "reflection_target_error": target_difference_text,
             "limit_status": limit_text,
             "motor_status": f"AZ {'ON' if s.az.motor_on else 'OFF'} | EL {'ON' if s.el.motor_on else 'OFF'}",
+            "correction_elapsed": f"{s.seconds_since_last_correction:8.1f} s solares",
+            "history_status": f"{len(s.history):d} / {s.history_limit:d} muestras",
             "iterations": f"{s.iterations:d}",
         }
         for key, text in values.items():
@@ -2379,6 +2486,86 @@ class DigitalTwinApp:
             c.create_rectangle(w - 330, 235, w - 42, 286, fill="#fff1f2", outline="#fecdd3")
             c.create_text(w - 314, 260, anchor="w", text="Sol bajo horizonte", fill="#9f1239", font=("Segoe UI", 11, "bold"))
 
+    def draw_drift_view(self) -> None:
+        """Grafica la deriva del spot y el tiempo desde la ultima correccion."""
+        c = self.drift_canvas
+        c.delete("all")
+        w, h = max(1, c.winfo_width()), max(1, c.winfo_height())
+        c.create_rectangle(0, 0, w, h, fill="#f4f4f4", outline="")
+        hist = list(self.state.history)
+        tracking_text = "ACTIVO" if self.state.tracking else "DETENIDO / POSE FIJA"
+        tracking_color = "#16883f" if self.state.tracking else "#b91c1c"
+        c.create_text(24, 22, anchor="w", text="Deriva temporal del punto reflejado", fill="#111111", font=("Segoe UI", 15, "bold"))
+        c.create_rectangle(24, 46, w - 24, 80, fill="#ffffff", outline="#c7c7c7")
+        c.create_rectangle(24, 46, 245, 80, fill=tracking_color, outline="")
+        c.create_text(38, 63, anchor="w", text=f"SEGUIMIENTO: {tracking_text}", fill="#ffffff", font=("Segoe UI", 10, "bold"))
+        c.create_text(
+            265,
+            63,
+            anchor="w",
+            text=(
+                f"Hora solar {self.active_datetime():%Y-%m-%d %H:%M:%S}   |   "
+                f"desde correccion {self.state.seconds_since_last_correction:.1f} s   |   "
+                f"historial {len(hist)}/{self.state.history_limit}"
+            ),
+            fill="#222222",
+            font=("Consolas", 10),
+        )
+
+        gap = 18
+        left = 24
+        right = w - 24
+        top = 96
+        bottom = h - 28
+        mid_x = (left + right) // 2
+        mid_y = (top + bottom) // 2
+        boxes = (
+            (left, top, mid_x - gap // 2, mid_y - gap // 2),
+            (mid_x + gap // 2, top, right, mid_y - gap // 2),
+            (left, mid_y + gap // 2, mid_x - gap // 2, bottom),
+            (mid_x + gap // 2, mid_y + gap // 2, right, bottom),
+        )
+        titles = (
+            "Error horizontal u vs tiempo",
+            "Error vertical v vs tiempo",
+            "Error radial vs tiempo",
+            "Tiempo desde ultima correccion",
+        )
+        labels = ("mm", "mm", "mm", "s solares")
+        colors = ("#2563eb", "#805ad5", "#c53030", "#16883f")
+        keys = ("err_u", "err_v", "err_radial", "elapsed_since_correction_s")
+        series: list[list[float]] = []
+        for key in keys:
+            values: list[float] = []
+            for sample in hist:
+                if key != "elapsed_since_correction_s" and not sample.get("spot_valid", True):
+                    continue
+                value = float(sample.get(key, 0.0))
+                if math.isfinite(value):
+                    values.append(value if key == "elapsed_since_correction_s" else value * 1000.0)
+            series.append(values)
+
+        for box, title, label, color, values in zip(boxes, titles, labels, colors, series):
+            self.draw_axes(c, *box, title, label)
+            if title == "Error radial vs tiempo":
+                upper = max(values + [1.0])
+                self.plot_series(c, box, values, color, 0.0, upper)
+            elif title == "Tiempo desde ultima correccion":
+                upper = max(values + [1.0])
+                self.plot_series(c, box, values, color, 0.0, upper)
+            else:
+                extent = max([abs(value) for value in values] + [1.0])
+                self.plot_series(c, box, values, color, -extent, extent)
+
+        if not hist:
+            c.create_text(w / 2, h / 2, text="Sin muestras: inicia la simulacion para formar la trayectoria", fill="#6b7280", font=("Segoe UI", 13, "bold"))
+        else:
+            first_time = str(hist[0].get("solar_time", ""))[11:19]
+            last_time = str(hist[-1].get("solar_time", ""))[11:19]
+            for box in boxes:
+                c.create_text(box[0] + 48, box[3] - 13, anchor="w", text=first_time, fill="#666666", font=("Consolas", 8))
+                c.create_text(box[2] - 18, box[3] - 13, anchor="e", text=last_time, fill="#666666", font=("Consolas", 8))
+
     def draw_diagnostic_view(self) -> None:
         """Dibuja diagnostico numerico de errores, motores, vectores y alertas."""
         c = self.diagnostic_canvas
@@ -2539,6 +2726,7 @@ def run_self_test() -> None:
     state = TwinState()
     state.use_live_time = False
     state.simulated_time = _dt.datetime(2026, 6, 21, 12, 0, 0)
+    state.advance_solar_time = False
     state.peralte = 0.0
     state.compute_geometry()
     state.az.angle_deg = state.target_acim
