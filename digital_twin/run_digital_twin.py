@@ -30,6 +30,11 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Callable
 
+try:
+    from digital_twin.error_model import ErrorConfig, ErrorModel, MotionErrorSample
+except ModuleNotFoundError:  # Permite ejecutar directamente este archivo .py.
+    from error_model import ErrorConfig, ErrorModel, MotionErrorSample
+
 
 TAU = 2.0 * math.pi
 DEG = math.pi / 180.0
@@ -660,6 +665,20 @@ class TwinState:
     target_vector: tuple[float, float, float] = (0.0, 1.0, 0.0)
     ideal_normal: tuple[float, float, float] = (0.0, 1.0, 0.0)
     actual_normal: tuple[float, float, float] = (0.0, 1.0, 0.0)
+    nominal_target_vector: tuple[float, float, float] = (0.0, 1.0, 0.0)
+    error_mode: str = "Ideal"
+    error_config: ErrorConfig = field(default_factory=ErrorConfig)
+    error_model: ErrorModel = field(init=False, repr=False)
+    motion_error_sample: MotionErrorSample = field(default_factory=MotionErrorSample)
+    ideal_spot_u: float = 0.0
+    ideal_spot_v: float = 0.0
+    ideal_spot_radial: float = 0.0
+    error_spot_u: float = 0.0
+    error_spot_v: float = 0.0
+    error_spot_radial: float = 0.0
+    corrected_spot_u: float = 0.0
+    corrected_spot_v: float = 0.0
+    corrected_spot_radial: float = 0.0
     history_limit: int = 720
     seconds_since_last_correction: float = 0.0
     correction_count: int = 0
@@ -684,6 +703,7 @@ class TwinState:
 
     def __post_init__(self) -> None:
         """Inicializa el origen reiniciable del reloj simulado."""
+        self.error_model = ErrorModel(self.error_config)
         if self.initial_simulated_time is None:
             self.initial_simulated_time = self.simulated_time
         self.set_history_limit(self.history_limit)
@@ -799,6 +819,9 @@ class TwinState:
             self._finish_tracking_interval()
         self.held_target_acim = self.target_acim
         self.held_target_elev = self.target_elev
+        az_delta = wrap_deg(self.held_target_acim - self.az.angle_deg)
+        el_delta = self.held_target_elev - self.el.angle_deg
+        self.motion_error_sample = self.error_model.sample_motion(az_delta, el_delta)
         self.az.target_deg = self.held_target_acim
         self.el.target_deg = self.held_target_elev
         if self.az.motor_on:
@@ -814,6 +837,62 @@ class TwinState:
         self.tracking_update_pending = False
         self.tracking_corrected_this_step = True
         self.mark_correction()
+
+    def resample_motion_errors(self, az_delta_deg: float = 0.0, el_delta_deg: float = 0.0) -> None:
+        """Genera una nueva muestra controlada para ruido y errores de sentido."""
+        self.motion_error_sample = self.error_model.sample_motion(az_delta_deg, el_delta_deg)
+
+    def _scenario_uses_errors(self, mode: str) -> bool:
+        return mode.strip().lower() != "ideal"
+
+    def scenario_target_vector(self, mode: str) -> tuple[float, float, float]:
+        """Devuelve el target nominal o el target fisico perturbado."""
+        return self.error_model.effective_target(
+            self.nominal_target_vector,
+            self._scenario_uses_errors(mode),
+        )
+
+    def scenario_normal(self, mode: str) -> tuple[float, float, float]:
+        """Devuelve la normal comandada ideal, con error o compensada."""
+        corrected = mode.strip().lower() == "corregido"
+        return self.error_model.normal_from_command(
+            self.az.angle_deg,
+            self.el.angle_deg + self.peralte,
+            self.motion_error_sample,
+            include_errors=self._scenario_uses_errors(mode),
+            corrected=corrected,
+        )
+
+    def _scenario_impact(
+        self,
+        mode: str,
+    ) -> tuple[float, float, float]:
+        """Calcula u, v y error radial para un escenario comparable."""
+        normal = self.scenario_normal(mode)
+        target = self.scenario_target_vector(mode)
+        try:
+            diagnostics = compute_reflection_diagnostics(self.sun_vector, normal, target)
+            impact = compute_target_impact(
+                (0.0, 0.0, 0.0),
+                diagnostics.reflected_direction,
+                target,
+                self.target_tolerance_m,
+            )
+        except ValueError:
+            impact = None
+        if impact is None or impact.point is None:
+            return (float("nan"), float("nan"), float("nan"))
+        return (impact.u_m, impact.v_m, impact.radial_error_m)
+
+    def compute_error_comparison(self) -> None:
+        """Actualiza simultaneamente los casos ideal, con error y corregido."""
+        self.ideal_spot_u, self.ideal_spot_v, self.ideal_spot_radial = self._scenario_impact("Ideal")
+        self.error_spot_u, self.error_spot_v, self.error_spot_radial = self._scenario_impact("Con error")
+        (
+            self.corrected_spot_u,
+            self.corrected_spot_v,
+            self.corrected_spot_radial,
+        ) = self._scenario_impact("Corregido")
 
     def target_vector_scaled(self) -> tuple[float, float, float]:
         """Devuelve el vector R hacia el concentrador en escala real o maqueta."""
@@ -844,8 +923,8 @@ class TwinState:
             math.cos(alt) * math.cos(az),
             math.sin(alt),
         )
-        self.target_vector = self.target_vector_scaled()
-        t_unit = normalize(self.target_vector)
+        self.nominal_target_vector = self.target_vector_scaled()
+        t_unit = normalize(self.nominal_target_vector)
         try:
             self.ideal_normal = compute_heliostat_normal(self.sun_vector, t_unit)
         except ValueError:
@@ -856,8 +935,10 @@ class TwinState:
         self.target_acim = self.raw_target_acim
         self.target_elev = clamp(self.raw_target_elev, 0.0, 90.0)
         self.target_saturated = abs(self.raw_target_elev - self.target_elev) > 1e-6
-        self.actual_normal = normal_from_angles(self.az.angle_deg, self.el.angle_deg + self.peralte)
+        self.target_vector = self.scenario_target_vector(self.error_mode)
+        self.actual_normal = self.scenario_normal(self.error_mode)
         self.compute_spot_error()
+        self.compute_error_comparison()
 
     def compute_spot_error(self) -> None:
         """Calcula el cruce real del rayo reflejado con el target virtual.
@@ -984,8 +1065,10 @@ class TwinState:
         # Los motores pueden cambiar la normal durante este mismo paso. El
         # impacto se vuelve a calcular para que la pantalla no lleve un ciclo de
         # retraso respecto de los angulos mostrados.
-        self.actual_normal = normal_from_angles(self.az.angle_deg, self.el.angle_deg + self.peralte)
+        self.target_vector = self.scenario_target_vector(self.error_mode)
+        self.actual_normal = self.scenario_normal(self.error_mode)
         self.compute_spot_error()
+        self.compute_error_comparison()
         self.iterations += 1
         self.set_history_limit(self.history_limit)
         self.history.append(
@@ -1004,6 +1087,10 @@ class TwinState:
                 "tracking_error_max_m": self.tracking_error_max_m,
                 "tracking_error_average_m": self.tracking_error_average_m,
                 "tracking_error_rms_m": self.tracking_error_rms_m,
+                "error_mode": self.error_mode,
+                "ideal_spot_radial": self.ideal_spot_radial,
+                "error_spot_radial": self.error_spot_radial,
+                "corrected_spot_radial": self.corrected_spot_radial,
                 "tracking": self.tracking,
                 "az": self.az.angle_deg,
                 "el": self.el.angle_deg,
@@ -1222,6 +1309,36 @@ class DigitalTwinApp:
         self.var("time_scale_choice", f"{self.state.solar_time_scale:g}x")
         self.var("tracking_interval_choice", self.last_tracking_interval_choice)
         self.var("scale_to_model", self.state.scale_to_model)
+        self.var("error_mode", self.state.error_mode)
+        for error_name in (
+            "enable_elevation_offset",
+            "elevation_offset_deg",
+            "enable_azimuth_offset",
+            "azimuth_offset_deg",
+            "enable_north_south_misalignment",
+            "north_south_misalignment_deg",
+            "enable_target_position_error",
+            "target_error_x_m",
+            "target_error_y_m",
+            "target_error_z_m",
+            "enable_heliostat_position_error",
+            "heliostat_error_x_m",
+            "heliostat_error_y_m",
+            "heliostat_error_z_m",
+            "enable_peralte_error",
+            "peralte_error_deg",
+            "enable_backlash",
+            "backlash_deg",
+            "enable_directional_error",
+            "upward_error_deg",
+            "downward_error_deg",
+            "enable_random_noise",
+            "random_noise_std_deg",
+            "random_seed",
+            "correction_azimuth_deg",
+            "correction_elevation_deg",
+        ):
+            self.var(f"error_{error_name}", getattr(self.state.error_config, error_name))
         for name in (
             "show_sun_vector",
             "show_normal_vector",
@@ -1303,6 +1420,7 @@ class DigitalTwinApp:
         self.build_geometry_block(left)
         self.build_auto_block(left)
         self.build_vector_block(left)
+        self.build_error_block(left)
         self.build_calibration_block(left)
         self.build_status_block(left)
 
@@ -1314,6 +1432,7 @@ class DigitalTwinApp:
         self.receiver_canvas = tk.Canvas(notebook, bg="#f4f4f4", highlightthickness=0)
         self.solar_canvas = tk.Canvas(notebook, bg="#f4f4f4", highlightthickness=0)
         self.drift_canvas = tk.Canvas(notebook, bg="#f4f4f4", highlightthickness=0)
+        self.error_canvas = tk.Canvas(notebook, bg="#f4f4f4", highlightthickness=0)
         self.diagnostic_canvas = tk.Canvas(notebook, bg="#f4f4f4", highlightthickness=0)
         self.logic_canvas = tk.Canvas(notebook, bg="#f7f7f7", highlightthickness=0)
         self.log_canvas = tk.Canvas(notebook, bg="#f7f7f7", highlightthickness=0)
@@ -1321,6 +1440,7 @@ class DigitalTwinApp:
         notebook.add(self.receiver_canvas, text="Pantalla / spot")
         notebook.add(self.solar_canvas, text="Trayectoria solar")
         notebook.add(self.drift_canvas, text="Deriva temporal")
+        notebook.add(self.error_canvas, text="Comparacion de errores")
         notebook.add(self.diagnostic_canvas, text="Diagnostico")
         notebook.add(self.logic_canvas, text="Flujo del gemelo")
         notebook.add(self.log_canvas, text="Eventos")
@@ -1552,6 +1672,72 @@ class DigitalTwinApp:
         for col in range(4):
             grid.columnconfigure(col, weight=1)
 
+    def build_error_block(self, parent: ttk.Frame) -> None:
+        """Construye activadores y parametros del modelo de errores."""
+        frame = ttk.LabelFrame(parent, text="Errores geometricos y mecanicos", style="Block.TLabelframe")
+        frame.pack(fill="x", padx=10, pady=5)
+        grid = ttk.Frame(frame, style="Panel.TFrame")
+        grid.pack(fill="x", padx=8, pady=7)
+        ttk.Label(grid, text="Caso mostrado", style="Small.TLabel").grid(row=0, column=0, sticky="w", padx=2, pady=2)
+        ttk.OptionMenu(
+            grid,
+            self.vars["error_mode"],
+            self.vars["error_mode"].get(),
+            "Ideal",
+            "Con error",
+            "Corregido",
+            command=lambda _=None: self.apply_controls(),
+        ).grid(row=0, column=1, columnspan=3, sticky="ew", padx=2, pady=2)
+
+        self.add_switch(grid, "Offset elevacion", "error_enable_elevation_offset", row=1, col=0)
+        self.add_entry(grid, "deg", "error_elevation_offset_deg", 1, 2)
+        self.add_switch(grid, "Offset acimut", "error_enable_azimuth_offset", row=2, col=0)
+        self.add_entry(grid, "deg", "error_azimuth_offset_deg", 2, 2)
+        self.add_switch(grid, "Eje norte-sur", "error_enable_north_south_misalignment", row=3, col=0)
+        self.add_entry(grid, "deg", "error_north_south_misalignment_deg", 3, 2)
+
+        self.add_switch(grid, "Error posicion target", "error_enable_target_position_error", row=4, col=0)
+        self.add_entry(grid, "X (m)", "error_target_error_x_m", 4, 2)
+        self.add_entry(grid, "Y (m)", "error_target_error_y_m", 5, 0)
+        self.add_entry(grid, "Z (m)", "error_target_error_z_m", 5, 2)
+
+        self.add_switch(grid, "Error coord. helio", "error_enable_heliostat_position_error", row=6, col=0)
+        self.add_entry(grid, "X (m)", "error_heliostat_error_x_m", 6, 2)
+        self.add_entry(grid, "Y (m)", "error_heliostat_error_y_m", 7, 0)
+        self.add_entry(grid, "Z (m)", "error_heliostat_error_z_m", 7, 2)
+
+        self.add_switch(grid, "Error peralte", "error_enable_peralte_error", row=8, col=0)
+        self.add_entry(grid, "deg", "error_peralte_error_deg", 8, 2)
+        self.add_switch(grid, "Backlash", "error_enable_backlash", row=9, col=0)
+        self.add_entry(grid, "deg", "error_backlash_deg", 9, 2)
+        self.add_switch(grid, "Error subida/bajada", "error_enable_directional_error", row=10, col=0)
+        self.add_entry(grid, "Subida deg", "error_upward_error_deg", 10, 2)
+        self.add_entry(grid, "Bajada deg", "error_downward_error_deg", 11, 2)
+        self.add_switch(grid, "Ruido aleatorio", "error_enable_random_noise", row=12, col=0)
+        self.add_entry(grid, "Sigma deg", "error_random_noise_std_deg", 12, 2)
+        self.add_entry(grid, "Semilla", "error_random_seed", 13, 0)
+        ttk.Button(
+            grid,
+            text="NUEVA MUESTRA",
+            style="Gold.TButton",
+            command=self.resample_errors,
+        ).grid(row=13, column=2, columnspan=2, sticky="ew", padx=3, pady=3)
+
+        ttk.Label(grid, text="Compensacion manual para caso Corregido", style="Small.TLabel").grid(
+            row=14, column=0, columnspan=4, sticky="w", padx=2, pady=(7, 2)
+        )
+        self.add_entry(grid, "Corr. acimut deg", "error_correction_azimuth_deg", 15, 0)
+        self.add_entry(grid, "Corr. elev. deg", "error_correction_elevation_deg", 15, 2)
+        ttk.Label(
+            grid,
+            text="XYZ usa +x oeste, +y sur, +z cenit. Cada switch es independiente.",
+            style="Small.TLabel",
+            wraplength=450,
+            justify="left",
+        ).grid(row=16, column=0, columnspan=4, sticky="ew", padx=2, pady=(5, 2))
+        for col in (1, 3):
+            grid.columnconfigure(col, weight=1)
+
     def build_calibration_block(self, parent: ttk.Frame) -> None:
         """Construye parametros de calibracion visual y de movimiento simulado.
 
@@ -1631,6 +1817,8 @@ class DigitalTwinApp:
             ("Intervalo de seguimiento", "tracking_interval"),
             ("Correcciones programadas", "tracking_update_count"),
             ("Error max/prom/RMS", "tracking_error_stats"),
+            ("Caso de errores", "error_case"),
+            ("Radial ideal/error/corr.", "error_comparison"),
             ("Historial deriva", "history_status"),
             ("Iteraciones", "iterations"),
         ]
@@ -1845,6 +2033,13 @@ class DigitalTwinApp:
         self.state.request_tracking_update()
         self.log_event("Correccion manual solicitada")
 
+    def resample_errors(self) -> None:
+        """Genera otra muestra de ruido sin cambiar la configuracion."""
+        self.apply_controls()
+        self.state.resample_motion_errors()
+        self.state.compute_geometry()
+        self.log_event("Nueva muestra de errores aleatorios")
+
     def apply_initial_datetime(self) -> None:
         """Aplica los campos de fecha/hora como nuevo origen de simulacion."""
         date_text = str(self.vars["date_text"].get()).strip()
@@ -1988,6 +2183,27 @@ class DigitalTwinApp:
             self.state.configure_tracking_updates(interval_value)
         self.last_tracking_interval_choice = interval_choice
 
+        config = self.state.error_config
+        for var_name, var in self.vars.items():
+            if not var_name.startswith("error_"):
+                continue
+            config_name = var_name.removeprefix("error_")
+            if not hasattr(config, config_name):
+                continue
+            try:
+                value = var.get()
+                current = getattr(config, config_name)
+                if isinstance(current, bool):
+                    setattr(config, config_name, bool(value))
+                elif isinstance(current, int):
+                    setattr(config, config_name, int(value))
+                else:
+                    setattr(config, config_name, float(value))
+            except (tk.TclError, TypeError, ValueError):
+                pass
+        config.backlash_deg = max(0.0, float(config.backlash_deg))
+        config.random_noise_std_deg = max(0.0, float(config.random_noise_std_deg))
+
         # Variables propias de cada eje: velocidad por PWM, motor ON/OFF,
         # limites, escala de conteo y velocidad maxima.
         self.state.az.pwm = float(self.vars["az_pwm"].get())
@@ -2064,6 +2280,17 @@ class DigitalTwinApp:
             "tracking_error_max_mm": s.tracking_error_max_m * 1000.0,
             "tracking_error_average_mm": s.tracking_error_average_m * 1000.0,
             "tracking_error_rms_mm": s.tracking_error_rms_m * 1000.0,
+            "error_mode": s.error_mode,
+            "active_errors": ", ".join(s.error_config.active_error_names()),
+            "ideal_spot_u_mm": s.ideal_spot_u * 1000.0,
+            "ideal_spot_v_mm": s.ideal_spot_v * 1000.0,
+            "ideal_spot_radial_mm": s.ideal_spot_radial * 1000.0,
+            "error_spot_u_mm": s.error_spot_u * 1000.0,
+            "error_spot_v_mm": s.error_spot_v * 1000.0,
+            "error_spot_radial_mm": s.error_spot_radial * 1000.0,
+            "corrected_spot_u_mm": s.corrected_spot_u * 1000.0,
+            "corrected_spot_v_mm": s.corrected_spot_v * 1000.0,
+            "corrected_spot_radial_mm": s.corrected_spot_radial * 1000.0,
             "zenith_deg": s.zenith,
             "altitude_deg": s.altitude,
             "solar_azimuth_deg": s.solar_azimuth,
@@ -2132,6 +2359,16 @@ class DigitalTwinApp:
         s.tracking_error_max_m = float(sample.get("tracking_error_max_mm", 0.0)) / 1000.0
         s.tracking_error_average_m = float(sample.get("tracking_error_average_mm", 0.0)) / 1000.0
         s.tracking_error_rms_m = float(sample.get("tracking_error_rms_mm", 0.0)) / 1000.0
+        s.error_mode = str(sample.get("error_mode", s.error_mode))
+        s.ideal_spot_u = float(sample.get("ideal_spot_u_mm", 0.0)) / 1000.0
+        s.ideal_spot_v = float(sample.get("ideal_spot_v_mm", 0.0)) / 1000.0
+        s.ideal_spot_radial = float(sample.get("ideal_spot_radial_mm", 0.0)) / 1000.0
+        s.error_spot_u = float(sample.get("error_spot_u_mm", 0.0)) / 1000.0
+        s.error_spot_v = float(sample.get("error_spot_v_mm", 0.0)) / 1000.0
+        s.error_spot_radial = float(sample.get("error_spot_radial_mm", 0.0)) / 1000.0
+        s.corrected_spot_u = float(sample.get("corrected_spot_u_mm", 0.0)) / 1000.0
+        s.corrected_spot_v = float(sample.get("corrected_spot_v_mm", 0.0)) / 1000.0
+        s.corrected_spot_radial = float(sample.get("corrected_spot_radial_mm", 0.0)) / 1000.0
         s.advance_solar_time = bool(sample.get("simulation_clock_running", s.advance_solar_time))
         s.solar_time_scale = float(sample.get("simulation_time_scale", s.solar_time_scale))
         s.simulation_step_s = float(sample.get("simulation_step_s", s.simulation_step_s))
@@ -2255,10 +2492,16 @@ class DigitalTwinApp:
             self.apply_controls()
             if self.jog_command and not self.state.automatic:
                 axis, direction = self.jog_command
+                previous_az = self.state.az.angle_deg
+                previous_el = self.state.el.angle_deg
                 if axis == "az":
                     self.state.az.jog(direction, dt)
                 else:
                     self.state.el.jog(direction, dt)
+                self.state.resample_motion_errors(
+                    wrap_deg(self.state.az.angle_deg - previous_az),
+                    self.state.el.angle_deg - previous_el,
+                )
             target_override = (0.0, 90.0) if self.current_mode == "home" else None
             self.state.update(dt, target_override=target_override)
         self.update_readouts()
@@ -2267,6 +2510,7 @@ class DigitalTwinApp:
         self.draw_receiver_view()
         self.draw_solar_path()
         self.draw_drift_view()
+        self.draw_error_view()
         self.draw_diagnostic_view()
         self.draw_logic()
         self.draw_event_log()
@@ -2335,6 +2579,12 @@ class DigitalTwinApp:
                 f"{s.tracking_error_max_m * 1000.0:6.2f} / "
                 f"{s.tracking_error_average_m * 1000.0:6.2f} / "
                 f"{s.tracking_error_rms_m * 1000.0:6.2f} mm"
+            ),
+            "error_case": f"{s.error_mode} | {len(s.error_config.active_error_names())} activos",
+            "error_comparison": (
+                f"{s.ideal_spot_radial * 1000.0:6.2f} / "
+                f"{s.error_spot_radial * 1000.0:6.2f} / "
+                f"{s.corrected_spot_radial * 1000.0:6.2f} mm"
             ),
             "history_status": f"{len(s.history):d} / {s.history_limit:d} muestras",
             "iterations": f"{s.iterations:d}",
@@ -2948,6 +3198,89 @@ class DigitalTwinApp:
             for box in boxes:
                 c.create_text(box[0] + 48, box[3] - 13, anchor="w", text=first_time, fill="#666666", font=("Consolas", 8))
                 c.create_text(box[2] - 18, box[3] - 13, anchor="e", text=last_time, fill="#666666", font=("Consolas", 8))
+
+    def draw_error_view(self) -> None:
+        """Compara los impactos ideal, perturbado y compensado."""
+        c = self.error_canvas
+        c.delete("all")
+        w, h = max(1, c.winfo_width()), max(1, c.winfo_height())
+        c.create_rectangle(0, 0, w, h, fill="#f4f4f4", outline="")
+        s = self.state
+        c.create_text(24, 22, anchor="w", text="Comparacion de errores geometricos y mecanicos", fill="#111111", font=("Segoe UI", 15, "bold"))
+        mode_color = {"Ideal": "#16883f", "Con error": "#b91c1c", "Corregido": "#2563eb"}.get(s.error_mode, "#475569")
+        c.create_rectangle(24, 48, 270, 82, fill=mode_color, outline="")
+        c.create_text(38, 65, anchor="w", text=f"CASO MOSTRADO: {s.error_mode.upper()}", fill="#ffffff", font=("Segoe UI", 10, "bold"))
+        active_names = s.error_config.active_error_names()
+        c.create_text(
+            292,
+            65,
+            anchor="w",
+            text="Activos: " + (", ".join(active_names) if active_names else "ninguno"),
+            fill="#222222",
+            font=("Segoe UI", 10),
+        )
+
+        cx, cy = w * 0.34, h * 0.52
+        half_pixels = max(80.0, min(w * 0.27, h * 0.35))
+        half_range_m = max(0.001, s.target_scale_m)
+        pixels_per_m = half_pixels / half_range_m
+        left, right = cx - half_pixels, cx + half_pixels
+        top, bottom = cy - half_pixels, cy + half_pixels
+        c.create_rectangle(left, top, right, bottom, fill="#fffdf5", outline="#6f6040", width=3)
+        for idx in range(-4, 5):
+            offset = half_pixels * idx / 4.0
+            color = "#8a7b58" if idx == 0 else "#ded5bc"
+            c.create_line(cx + offset, top, cx + offset, bottom, fill=color)
+            c.create_line(left, cy - offset, right, cy - offset, fill=color)
+        tolerance_px = min(half_pixels, s.target_tolerance_m * pixels_per_m)
+        c.create_oval(cx - tolerance_px, cy - tolerance_px, cx + tolerance_px, cy + tolerance_px, outline="#16883f", width=2, dash=(5, 3))
+        c.create_text(cx, bottom + 30, text="u [mm] oeste +", fill="#333333", font=("Segoe UI", 9, "bold"))
+        c.create_text(left, top - 18, anchor="w", text="v [mm] cenit +", fill="#333333", font=("Segoe UI", 9, "bold"))
+
+        cases = (
+            ("Ideal", s.ideal_spot_u, s.ideal_spot_v, s.ideal_spot_radial, "#16883f"),
+            ("Con error", s.error_spot_u, s.error_spot_v, s.error_spot_radial, "#d62828"),
+            ("Corregido", s.corrected_spot_u, s.corrected_spot_v, s.corrected_spot_radial, "#2563eb"),
+        )
+        for label, u_m, v_m, _radial_m, color in cases:
+            if not (math.isfinite(u_m) and math.isfinite(v_m)):
+                continue
+            px = clamp(cx + u_m * pixels_per_m, left, right)
+            py = clamp(cy - v_m * pixels_per_m, top, bottom)
+            radius = 9 if label == s.error_mode else 6
+            c.create_oval(px - radius, py - radius, px + radius, py + radius, fill=color, outline="#ffffff", width=2)
+            c.create_text(px + 10, py - 10, anchor="w", text=label, fill=color, font=("Segoe UI", 8, "bold"))
+
+        panel_x = w * 0.68
+        panel_left = panel_x - 80
+        c.create_rectangle(panel_left, 112, w - 28, h - 42, fill="#ffffff", outline="#c7c7c7")
+        c.create_text(panel_x, 136, anchor="w", text="Errores sobre el target", fill="#111111", font=("Segoe UI", 13, "bold"))
+        y = 176
+        max_radial_mm = max(
+            [value * 1000.0 for _label, _u, _v, value, _color in cases if math.isfinite(value)] + [1.0]
+        )
+        for label, u_m, v_m, radial_m, color in cases:
+            c.create_text(panel_x, y, anchor="w", text=label, fill=color, font=("Segoe UI", 11, "bold"))
+            if math.isfinite(radial_m):
+                values_text = f"u {u_m * 1000.0:+8.2f} | v {v_m * 1000.0:+8.2f} | r {radial_m * 1000.0:8.2f} mm"
+                c.create_text(panel_x, y + 24, anchor="w", text=values_text, fill="#222222", font=("Consolas", 10))
+                c.create_rectangle(panel_x, y + 46, w - 62, y + 62, fill="#ececec", outline="#cccccc")
+                bar_end = panel_x + (w - 62 - panel_x) * radial_m * 1000.0 / max_radial_mm
+                c.create_rectangle(panel_x, y + 46, bar_end, y + 62, fill=color, outline="")
+            else:
+                c.create_text(panel_x, y + 24, anchor="w", text="sin impacto", fill="#6b7280", font=("Consolas", 10))
+            y += 100
+
+        sample = s.motion_error_sample
+        sample_text = (
+            "Muestra dependiente del movimiento\n"
+            f"Direccion AZ/EL: {sample.az_direction:+d} / {sample.el_direction:+d}\n"
+            f"Backlash AZ/EL: {sample.backlash_az_deg:+.4f} / {sample.backlash_el_deg:+.4f} deg\n"
+            f"Error subida/bajada: {sample.directional_el_deg:+.4f} deg\n"
+            f"Ruido AZ/EL: {sample.noise_az_deg:+.4f} / {sample.noise_el_deg:+.4f} deg\n"
+            f"Compensacion AZ/EL: {s.error_config.correction_azimuth_deg:+.4f} / {s.error_config.correction_elevation_deg:+.4f} deg"
+        )
+        c.create_text(panel_x, y + 8, anchor="nw", text=sample_text, fill="#222222", font=("Consolas", 10))
 
     def draw_diagnostic_view(self) -> None:
         """Dibuja diagnostico numerico de errores, motores, vectores y alertas."""
