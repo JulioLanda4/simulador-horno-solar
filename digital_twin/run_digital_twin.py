@@ -2723,7 +2723,10 @@ class DigitalTwinApp:
         if interval_choice.lower() == "manual":
             self.state.configure_tracking_updates(None)
         else:
-            interval_value = float(interval_choice.lower().removesuffix("s").strip())
+            interval_text = interval_choice.lower().strip()
+            if interval_text.endswith("s"):
+                interval_text = interval_text[:-1].strip()
+            interval_value = float(interval_text)
             self.state.configure_tracking_updates(interval_value)
         self.last_tracking_interval_choice = interval_choice
 
@@ -2731,7 +2734,7 @@ class DigitalTwinApp:
         for var_name, var in self.vars.items():
             if not var_name.startswith("error_"):
                 continue
-            config_name = var_name.removeprefix("error_")
+            config_name = var_name[len("error_") :]
             if not hasattr(config, config_name):
                 continue
             try:
@@ -2752,7 +2755,7 @@ class DigitalTwinApp:
         for var_name, var in self.vars.items():
             if not var_name.startswith("correction_"):
                 continue
-            config_name = var_name.removeprefix("correction_")
+            config_name = var_name[len("correction_") :]
             if not hasattr(correction_config, config_name):
                 continue
             try:
@@ -2831,7 +2834,9 @@ class DigitalTwinApp:
         # Saneamiento de parametros para evitar valores negativos o imposibles.
         self.state.cdr = max(0.0, float(self.state.cdr))
         self.state.delay_s = max(0.01, float(self.state.delay_s))
-        scale_text = str(self.vars["time_scale_choice"].get()).strip().lower().removesuffix("x")
+        scale_text = str(self.vars["time_scale_choice"].get()).strip().lower()
+        if scale_text.endswith("x"):
+            scale_text = scale_text[:-1].strip()
         self.state.solar_time_scale = max(0.0, min(float(scale_text), 3600.0))
         self.state.simulation_step_s = max(0.0, min(float(self.state.simulation_step_s), 86400.0))
         self.state.set_history_limit(int(self.state.history_limit))
