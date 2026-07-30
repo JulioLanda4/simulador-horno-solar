@@ -35,6 +35,11 @@ try:
 except ModuleNotFoundError:  # Permite ejecutar directamente este archivo .py.
     from error_model import ErrorConfig, ErrorModel, MotionErrorSample
 
+try:
+    from digital_twin.correction_model import CorrectionConfig, CorrectionModel
+except ModuleNotFoundError:  # Permite ejecutar directamente este archivo .py.
+    from correction_model import CorrectionConfig, CorrectionModel
+
 
 TAU = 2.0 * math.pi
 DEG = math.pi / 180.0
@@ -669,6 +674,12 @@ class TwinState:
     error_mode: str = "Ideal"
     error_config: ErrorConfig = field(default_factory=ErrorConfig)
     error_model: ErrorModel = field(init=False, repr=False)
+    correction_config: CorrectionConfig = field(default_factory=CorrectionConfig)
+    correction_model: CorrectionModel = field(init=False, repr=False)
+    drift_correction_az_deg: float = 0.0
+    drift_correction_el_deg: float = 0.0
+    drift_correction_pending: bool = False
+    drift_corrected_this_step: bool = False
     motion_error_sample: MotionErrorSample = field(default_factory=MotionErrorSample)
     ideal_spot_u: float = 0.0
     ideal_spot_v: float = 0.0
@@ -704,6 +715,7 @@ class TwinState:
     def __post_init__(self) -> None:
         """Inicializa el origen reiniciable del reloj simulado."""
         self.error_model = ErrorModel(self.error_config)
+        self.correction_model = CorrectionModel(self.correction_config)
         if self.initial_simulated_time is None:
             self.initial_simulated_time = self.simulated_time
         self.set_history_limit(self.history_limit)
@@ -715,6 +727,7 @@ class TwinState:
         self.seconds_since_last_correction = 0.0
         self.clear_history()
         self.reset_tracking_schedule()
+        self.reset_drift_correction()
 
     def reset_simulated_time(self) -> None:
         """Regresa el reloj a la fecha/hora inicial configurada."""
@@ -724,6 +737,7 @@ class TwinState:
         self.seconds_since_last_correction = 0.0
         self.clear_history()
         self.reset_tracking_schedule()
+        self.reset_drift_correction()
 
     def step_simulated_time(self, seconds: float | None = None) -> float:
         """Avanza manualmente una cantidad definida y devuelve ese avance."""
@@ -790,6 +804,37 @@ class TwinState:
         """Solicita una correccion para el siguiente paso del simulador."""
         self.tracking_update_pending = True
 
+    def reset_drift_correction(self) -> None:
+        """Borra la compensacion dinamica sin cambiar los errores simulados."""
+        self.correction_model.reset()
+        self.drift_correction_az_deg = 0.0
+        self.drift_correction_el_deg = 0.0
+        self.drift_correction_pending = False
+        self.drift_corrected_this_step = False
+
+    def request_drift_correction(self) -> None:
+        """Solicita una observacion/correccion del impacto en el siguiente paso."""
+        self.drift_correction_pending = True
+
+    def _update_drift_correction(self, simulated_elapsed_s: float) -> None:
+        """Actualiza una vez la estrategia activa usando el impacto observado."""
+        target_distance_m = v_norm(self.scenario_target_vector("Con error"))
+        correction_az, correction_el = self.correction_model.update(
+            simulated_elapsed_s=simulated_elapsed_s,
+            observed_u_m=self.corrected_spot_u,
+            observed_v_m=self.corrected_spot_v,
+            target_distance_m=target_distance_m,
+            # "Impacto observado" es deliberadamente manual: solo el boton
+            # solicita una captura. La estrategia de camara conserva su propio
+            # temporizador automatico dentro de CorrectionModel.
+            observation_trigger=False,
+            force=self.drift_correction_pending,
+        )
+        self.drift_correction_az_deg = correction_az
+        self.drift_correction_el_deg = correction_el
+        self.drift_corrected_this_step = self.correction_model.corrected_this_step
+        self.drift_correction_pending = False
+
     def _reset_interval_error_accumulators(self) -> None:
         self._interval_error_max_m = 0.0
         self._interval_error_sum_m = 0.0
@@ -855,9 +900,14 @@ class TwinState:
     def scenario_normal(self, mode: str) -> tuple[float, float, float]:
         """Devuelve la normal comandada ideal, con error o compensada."""
         corrected = mode.strip().lower() == "corregido"
+        command_az = self.az.angle_deg
+        command_el = self.el.angle_deg + self.peralte
+        if corrected:
+            command_az += self.drift_correction_az_deg
+            command_el += self.drift_correction_el_deg
         return self.error_model.normal_from_command(
-            self.az.angle_deg,
-            self.el.angle_deg + self.peralte,
+            command_az,
+            command_el,
             self.motion_error_sample,
             include_errors=self._scenario_uses_errors(mode),
             corrected=corrected,
@@ -1021,6 +1071,7 @@ class TwinState:
             self.reset_tracking_schedule()
         self._last_tracking_state = self.tracking
         self.tracking_corrected_this_step = False
+        self.drift_corrected_this_step = False
 
         self.compute_geometry()
         if target_override:
@@ -1069,6 +1120,14 @@ class TwinState:
         self.actual_normal = self.scenario_normal(self.error_mode)
         self.compute_spot_error()
         self.compute_error_comparison()
+        # La estrategia observa el impacto corregido anterior y actualiza una
+        # sola vez por paso. Luego se recalculan los tres escenarios para que
+        # la interfaz muestre inmediatamente el efecto de la compensacion.
+        self._update_drift_correction(solar_elapsed_s)
+        self.target_vector = self.scenario_target_vector(self.error_mode)
+        self.actual_normal = self.scenario_normal(self.error_mode)
+        self.compute_spot_error()
+        self.compute_error_comparison()
         self.iterations += 1
         self.set_history_limit(self.history_limit)
         self.history.append(
@@ -1091,6 +1150,11 @@ class TwinState:
                 "ideal_spot_radial": self.ideal_spot_radial,
                 "error_spot_radial": self.error_spot_radial,
                 "corrected_spot_radial": self.corrected_spot_radial,
+                "drift_correction_strategy": self.correction_config.strategy,
+                "drift_correction_az_deg": self.drift_correction_az_deg,
+                "drift_correction_el_deg": self.drift_correction_el_deg,
+                "drift_correction_count": self.correction_model.update_count,
+                "drift_corrected": self.drift_corrected_this_step,
                 "tracking": self.tracking,
                 "az": self.az.angle_deg,
                 "el": self.el.angle_deg,
@@ -1339,6 +1403,28 @@ class DigitalTwinApp:
             "correction_elevation_deg",
         ):
             self.var(f"error_{error_name}", getattr(self.state.error_config, error_name))
+        for correction_name in (
+            "enabled",
+            "strategy",
+            "constant_az_deg",
+            "constant_el_deg",
+            "time_az_rate_deg_per_hour",
+            "time_el_rate_deg_per_hour",
+            "polynomial_az_c0",
+            "polynomial_az_c1",
+            "polynomial_az_c2",
+            "polynomial_el_c0",
+            "polynomial_el_c1",
+            "polynomial_el_c2",
+            "image_gain_az",
+            "image_gain_el",
+            "image_max_step_deg",
+            "camera_interval_s",
+        ):
+            self.var(
+                f"correction_{correction_name}",
+                getattr(self.state.correction_config, correction_name),
+            )
         for name in (
             "show_sun_vector",
             "show_normal_vector",
@@ -1421,6 +1507,7 @@ class DigitalTwinApp:
         self.build_auto_block(left)
         self.build_vector_block(left)
         self.build_error_block(left)
+        self.build_correction_block(left)
         self.build_calibration_block(left)
         self.build_status_block(left)
 
@@ -1433,6 +1520,7 @@ class DigitalTwinApp:
         self.solar_canvas = tk.Canvas(notebook, bg="#f4f4f4", highlightthickness=0)
         self.drift_canvas = tk.Canvas(notebook, bg="#f4f4f4", highlightthickness=0)
         self.error_canvas = tk.Canvas(notebook, bg="#f4f4f4", highlightthickness=0)
+        self.correction_canvas = tk.Canvas(notebook, bg="#f4f4f4", highlightthickness=0)
         self.diagnostic_canvas = tk.Canvas(notebook, bg="#f4f4f4", highlightthickness=0)
         self.logic_canvas = tk.Canvas(notebook, bg="#f7f7f7", highlightthickness=0)
         self.log_canvas = tk.Canvas(notebook, bg="#f7f7f7", highlightthickness=0)
@@ -1441,6 +1529,7 @@ class DigitalTwinApp:
         notebook.add(self.solar_canvas, text="Trayectoria solar")
         notebook.add(self.drift_canvas, text="Deriva temporal")
         notebook.add(self.error_canvas, text="Comparacion de errores")
+        notebook.add(self.correction_canvas, text="Correccion de deriva")
         notebook.add(self.diagnostic_canvas, text="Diagnostico")
         notebook.add(self.logic_canvas, text="Flujo del gemelo")
         notebook.add(self.log_canvas, text="Eventos")
@@ -1735,6 +1824,81 @@ class DigitalTwinApp:
             wraplength=450,
             justify="left",
         ).grid(row=16, column=0, columnspan=4, sticky="ew", padx=2, pady=(5, 2))
+        for col in (1, 3):
+            grid.columnconfigure(col, weight=1)
+
+    def build_correction_block(self, parent: ttk.Frame) -> None:
+        """Construye las cinco estrategias progresivas de correccion de deriva."""
+        frame = ttk.LabelFrame(parent, text="Correccion de deriva", style="Block.TLabelframe")
+        frame.pack(fill="x", padx=10, pady=5)
+        grid = ttk.Frame(frame, style="Panel.TFrame")
+        grid.pack(fill="x", padx=8, pady=7)
+        self.add_switch(grid, "Activar correccion", "correction_enabled", row=0, col=0)
+        ttk.Label(grid, text="Estrategia", style="Small.TLabel").grid(
+            row=1, column=0, sticky="w", padx=2, pady=2
+        )
+        ttk.OptionMenu(
+            grid,
+            self.vars["correction_strategy"],
+            self.vars["correction_strategy"].get(),
+            *CorrectionModel.STRATEGIES,
+            command=lambda _=None: self.apply_controls(),
+        ).grid(row=1, column=1, columnspan=3, sticky="ew", padx=2, pady=2)
+
+        ttk.Label(grid, text="Offset constante", style="Small.TLabel").grid(
+            row=2, column=0, columnspan=4, sticky="w", padx=2, pady=(6, 2)
+        )
+        self.add_entry(grid, "AZ deg", "correction_constant_az_deg", 3, 0)
+        self.add_entry(grid, "EL deg", "correction_constant_el_deg", 3, 2)
+
+        ttk.Label(grid, text="Dependiente del tiempo", style="Small.TLabel").grid(
+            row=4, column=0, columnspan=4, sticky="w", padx=2, pady=(6, 2)
+        )
+        self.add_entry(grid, "AZ deg/h", "correction_time_az_rate_deg_per_hour", 5, 0)
+        self.add_entry(grid, "EL deg/h", "correction_time_el_rate_deg_per_hour", 5, 2)
+
+        ttk.Label(grid, text="Polinomio c0 + c1*t + c2*t^2 (t en horas)", style="Small.TLabel").grid(
+            row=6, column=0, columnspan=4, sticky="w", padx=2, pady=(6, 2)
+        )
+        self.add_entry(grid, "AZ c0", "correction_polynomial_az_c0", 7, 0)
+        self.add_entry(grid, "AZ c1", "correction_polynomial_az_c1", 7, 2)
+        self.add_entry(grid, "AZ c2", "correction_polynomial_az_c2", 8, 0)
+        self.add_entry(grid, "EL c0", "correction_polynomial_el_c0", 8, 2)
+        self.add_entry(grid, "EL c1", "correction_polynomial_el_c1", 9, 0)
+        self.add_entry(grid, "EL c2", "correction_polynomial_el_c2", 9, 2)
+
+        ttk.Label(grid, text="Impacto observado / camara", style="Small.TLabel").grid(
+            row=10, column=0, columnspan=4, sticky="w", padx=2, pady=(6, 2)
+        )
+        self.add_entry(grid, "Ganancia AZ", "correction_image_gain_az", 11, 0)
+        self.add_entry(grid, "Ganancia EL", "correction_image_gain_el", 11, 2)
+        self.add_entry(grid, "Paso max deg", "correction_image_max_step_deg", 12, 0)
+        self.add_entry(grid, "Camara cada s", "correction_camera_interval_s", 12, 2)
+
+        buttons = ttk.Frame(grid, style="Panel.TFrame")
+        buttons.grid(row=13, column=0, columnspan=4, sticky="ew", pady=(7, 2))
+        ttk.Button(
+            buttons,
+            text="CORREGIR DESDE IMPACTO",
+            style="Gold.TButton",
+            command=self.request_drift_correction,
+        ).pack(side="left", fill="x", expand=True, padx=(0, 3))
+        ttk.Button(
+            buttons,
+            text="RESET CORRECCION",
+            style="Manual.TButton",
+            command=self.reset_drift_correction,
+        ).pack(side="left", fill="x", expand=True, padx=(3, 0))
+        self.correction_status_label = ttk.Label(
+            grid,
+            text="Sin correccion dinamica",
+            style="Small.TLabel",
+            wraplength=450,
+            justify="left",
+        )
+        self.correction_status_label.grid(
+            row=14, column=0, columnspan=4, sticky="ew", padx=2, pady=(5, 2)
+        )
         for col in (1, 3):
             grid.columnconfigure(col, weight=1)
 
@@ -2040,6 +2204,26 @@ class DigitalTwinApp:
         self.state.compute_geometry()
         self.log_event("Nueva muestra de errores aleatorios")
 
+    def request_drift_correction(self) -> None:
+        """Solicita una actualizacion basada en el impacto observado."""
+        self.apply_controls()
+        if not self.state.correction_config.enabled:
+            self.log_event("Activa Correccion de deriva antes de corregir")
+            return
+        if self.state.correction_config.strategy not in (
+            "Impacto observado",
+            "Camara periodica",
+        ):
+            self.log_event("El boton de impacto requiere estrategia observada o camara")
+            return
+        self.state.request_drift_correction()
+        self.log_event("Correccion desde impacto solicitada")
+
+    def reset_drift_correction(self) -> None:
+        """Reinicia la compensacion y su historial de actualizaciones."""
+        self.state.reset_drift_correction()
+        self.log_event("Correccion de deriva reiniciada")
+
     def apply_initial_datetime(self) -> None:
         """Aplica los campos de fecha/hora como nuevo origen de simulacion."""
         date_text = str(self.vars["date_text"].get()).strip()
@@ -2204,6 +2388,31 @@ class DigitalTwinApp:
         config.backlash_deg = max(0.0, float(config.backlash_deg))
         config.random_noise_std_deg = max(0.0, float(config.random_noise_std_deg))
 
+        correction_config = self.state.correction_config
+        for var_name, var in self.vars.items():
+            if not var_name.startswith("correction_"):
+                continue
+            config_name = var_name.removeprefix("correction_")
+            if not hasattr(correction_config, config_name):
+                continue
+            try:
+                value = var.get()
+                current = getattr(correction_config, config_name)
+                if isinstance(current, bool):
+                    setattr(correction_config, config_name, bool(value))
+                elif isinstance(current, str):
+                    setattr(correction_config, config_name, str(value))
+                else:
+                    setattr(correction_config, config_name, float(value))
+            except (tk.TclError, TypeError, ValueError):
+                pass
+        correction_config.image_max_step_deg = max(
+            0.0, float(correction_config.image_max_step_deg)
+        )
+        correction_config.camera_interval_s = max(
+            0.001, float(correction_config.camera_interval_s)
+        )
+
         # Variables propias de cada eje: velocidad por PWM, motor ON/OFF,
         # limites, escala de conteo y velocidad maxima.
         self.state.az.pwm = float(self.vars["az_pwm"].get())
@@ -2291,6 +2500,12 @@ class DigitalTwinApp:
             "corrected_spot_u_mm": s.corrected_spot_u * 1000.0,
             "corrected_spot_v_mm": s.corrected_spot_v * 1000.0,
             "corrected_spot_radial_mm": s.corrected_spot_radial * 1000.0,
+            "drift_correction_enabled": s.correction_config.enabled,
+            "drift_correction_strategy": s.correction_config.strategy,
+            "drift_correction_az_deg": s.drift_correction_az_deg,
+            "drift_correction_el_deg": s.drift_correction_el_deg,
+            "drift_correction_count": s.correction_model.update_count,
+            "drift_corrected": s.drift_corrected_this_step,
             "zenith_deg": s.zenith,
             "altitude_deg": s.altitude,
             "solar_azimuth_deg": s.solar_azimuth,
@@ -2369,6 +2584,24 @@ class DigitalTwinApp:
         s.corrected_spot_u = float(sample.get("corrected_spot_u_mm", 0.0)) / 1000.0
         s.corrected_spot_v = float(sample.get("corrected_spot_v_mm", 0.0)) / 1000.0
         s.corrected_spot_radial = float(sample.get("corrected_spot_radial_mm", 0.0)) / 1000.0
+        s.correction_config.enabled = bool(
+            sample.get("drift_correction_enabled", s.correction_config.enabled)
+        )
+        s.correction_config.strategy = str(
+            sample.get("drift_correction_strategy", s.correction_config.strategy)
+        )
+        s.drift_correction_az_deg = float(
+            sample.get("drift_correction_az_deg", s.drift_correction_az_deg)
+        )
+        s.drift_correction_el_deg = float(
+            sample.get("drift_correction_el_deg", s.drift_correction_el_deg)
+        )
+        s.correction_model.correction_az_deg = s.drift_correction_az_deg
+        s.correction_model.correction_el_deg = s.drift_correction_el_deg
+        s.correction_model.update_count = int(
+            sample.get("drift_correction_count", s.correction_model.update_count)
+        )
+        s.drift_corrected_this_step = bool(sample.get("drift_corrected", False))
         s.advance_solar_time = bool(sample.get("simulation_clock_running", s.advance_solar_time))
         s.solar_time_scale = float(sample.get("simulation_time_scale", s.solar_time_scale))
         s.simulation_step_s = float(sample.get("simulation_step_s", s.simulation_step_s))
@@ -2459,6 +2692,19 @@ class DigitalTwinApp:
             gauge.redraw()
         for switch in self.switches:
             switch.redraw()
+        config = self.state.correction_config
+        tolerance_status = (
+            "EN TOLERANCIA"
+            if math.isfinite(self.state.corrected_spot_radial)
+            and self.state.corrected_spot_radial <= self.state.target_tolerance_m
+            else "FUERA DE TOLERANCIA"
+        )
+        status = (
+            f"{config.strategy} | AZ {self.state.drift_correction_az_deg:+.4f} deg | "
+            f"EL {self.state.drift_correction_el_deg:+.4f} deg | "
+            f"actualizaciones {self.state.correction_model.update_count} | {tolerance_status}"
+        )
+        self.correction_status_label.configure(text=status)
         self.update_mode_visuals()
 
     def update_mode_visuals(self) -> None:
@@ -2511,6 +2757,7 @@ class DigitalTwinApp:
         self.draw_solar_path()
         self.draw_drift_view()
         self.draw_error_view()
+        self.draw_correction_view()
         self.draw_diagnostic_view()
         self.draw_logic()
         self.draw_event_log()
@@ -3278,9 +3525,80 @@ class DigitalTwinApp:
             f"Backlash AZ/EL: {sample.backlash_az_deg:+.4f} / {sample.backlash_el_deg:+.4f} deg\n"
             f"Error subida/bajada: {sample.directional_el_deg:+.4f} deg\n"
             f"Ruido AZ/EL: {sample.noise_az_deg:+.4f} / {sample.noise_el_deg:+.4f} deg\n"
-            f"Compensacion AZ/EL: {s.error_config.correction_azimuth_deg:+.4f} / {s.error_config.correction_elevation_deg:+.4f} deg"
+            f"Compensacion manual AZ/EL: {s.error_config.correction_azimuth_deg:+.4f} / {s.error_config.correction_elevation_deg:+.4f} deg\n"
+            f"Correccion deriva AZ/EL: {s.drift_correction_az_deg:+.4f} / {s.drift_correction_el_deg:+.4f} deg"
         )
         c.create_text(panel_x, y + 8, anchor="nw", text=sample_text, fill="#222222", font=("Consolas", 10))
+
+    def draw_correction_view(self) -> None:
+        """Compara deriva sin/con correccion y grafica el comando aplicado."""
+        c = self.correction_canvas
+        c.delete("all")
+        w, h = max(1, c.winfo_width()), max(1, c.winfo_height())
+        c.create_rectangle(0, 0, w, h, fill="#f4f4f4", outline="")
+        s = self.state
+        c.create_text(
+            24,
+            22,
+            anchor="w",
+            text="Correccion progresiva de deriva",
+            fill="#111111",
+            font=("Segoe UI", 15, "bold"),
+        )
+        tolerance_status = (
+            "EN TOLERANCIA"
+            if math.isfinite(s.corrected_spot_radial)
+            and s.corrected_spot_radial <= s.target_tolerance_m
+            else "FUERA DE TOLERANCIA"
+        )
+        summary = (
+            f"{s.correction_config.strategy} | AZ {s.drift_correction_az_deg:+.4f} deg | "
+            f"EL {s.drift_correction_el_deg:+.4f} deg | "
+            f"actualizaciones {s.correction_model.update_count} | {tolerance_status}"
+        )
+        c.create_text(24, 52, anchor="w", text=summary, fill="#333333", font=("Consolas", 10))
+        top_box = (24, 82, w - 24, int(h * 0.52))
+        bottom_box = (24, int(h * 0.57), w - 24, h - 34)
+        self.draw_axes(c, *top_box, "Error radial: sin correccion vs corregido", "mm")
+        self.draw_axes(c, *bottom_box, "Compensacion angular aplicada", "deg")
+
+        hist = list(s.history)
+        if not hist:
+            c.create_text(
+                w / 2,
+                h / 2,
+                text="Sin muestras: inicia la simulacion para comparar",
+                fill="#6b7280",
+                font=("Segoe UI", 12, "bold"),
+            )
+            return
+
+        def finite_value(sample: dict[str, object], key: str) -> float:
+            value = float(sample.get(key, 0.0))
+            return value if math.isfinite(value) else 0.0
+
+        without_mm = [finite_value(sample, "error_spot_radial") * 1000.0 for sample in hist]
+        corrected_mm = [finite_value(sample, "corrected_spot_radial") * 1000.0 for sample in hist]
+        correction_az = [finite_value(sample, "drift_correction_az_deg") for sample in hist]
+        correction_el = [finite_value(sample, "drift_correction_el_deg") for sample in hist]
+        radial_max = max(without_mm + corrected_mm + [1.0])
+        angular_extent = max([abs(value) for value in correction_az + correction_el] + [0.1])
+        self.plot_series(c, top_box, without_mm, "#d62828", 0.0, radial_max)
+        self.plot_series(c, top_box, corrected_mm, "#2563eb", 0.0, radial_max)
+        self.plot_series(c, bottom_box, correction_az, "#7c3aed", -angular_extent, angular_extent)
+        self.plot_series(c, bottom_box, correction_el, "#0f766e", -angular_extent, angular_extent)
+        c.create_text(w - 42, 100, anchor="ne", text="rojo: sin correccion   azul: corregido", fill="#333333", font=("Segoe UI", 9, "bold"))
+        c.create_text(w - 42, bottom_box[1] + 18, anchor="ne", text="morado: AZ   verde: EL", fill="#333333", font=("Segoe UI", 9, "bold"))
+
+        if len(hist) >= 2:
+            left = top_box[0] + 45
+            right = top_box[2] - 16
+            top = top_box[1] + 18
+            bottom = top_box[3] - 30
+            for idx, sample in enumerate(hist):
+                if bool(sample.get("drift_corrected", False)):
+                    x = left + (right - left) * idx / (len(hist) - 1)
+                    c.create_line(x, top, x, bottom, fill="#d69e2e", width=1, dash=(3, 3))
 
     def draw_diagnostic_view(self) -> None:
         """Dibuja diagnostico numerico de errores, motores, vectores y alertas."""
