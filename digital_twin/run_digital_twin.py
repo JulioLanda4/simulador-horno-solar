@@ -23,12 +23,48 @@ import argparse
 import csv
 import datetime as _dt
 import math
+import time
 import tkinter as tk
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Callable
+
+try:
+    from digital_twin.error_model import ErrorConfig, ErrorModel, MotionErrorSample
+except ModuleNotFoundError:  # Permite ejecutar directamente este archivo .py.
+    from error_model import ErrorConfig, ErrorModel, MotionErrorSample
+
+try:
+    from digital_twin.correction_model import CorrectionConfig, CorrectionModel
+except ModuleNotFoundError:  # Permite ejecutar directamente este archivo .py.
+    from correction_model import CorrectionConfig, CorrectionModel
+
+try:
+    from digital_twin.facet_model import (
+        Facet,
+        FacetRayResult,
+        build_compact_facets,
+        trace_facets,
+    )
+except ModuleNotFoundError:  # Permite ejecutar directamente este archivo .py.
+    from facet_model import (
+        Facet,
+        FacetRayResult,
+        build_compact_facets,
+        trace_facets,
+    )
+
+try:
+    from digital_twin.spot_model import (
+        SpotMapResult,
+        SpotMetrics,
+        contribution_from_ray,
+        generate_spot_map,
+    )
+except ModuleNotFoundError:  # Permite ejecutar directamente este archivo .py.
+    from spot_model import SpotMapResult, SpotMetrics, contribution_from_ray, generate_spot_map
 
 
 TAU = 2.0 * math.pi
@@ -104,6 +140,271 @@ def v_unit(a: tuple[float, float, float]) -> tuple[float, float, float]:
     if n < 1e-12:
         return (0.0, 0.0, 0.0)
     return (a[0] / n, a[1] / n, a[2] / n)
+
+
+def normalize(v: tuple[float, float, float]) -> tuple[float, float, float]:
+    """Devuelve el vector unitario asociado a ``v``.
+
+    Las componentes pueden pertenecer al marco global ``+x`` oeste, ``+y`` sur,
+    ``+z`` cenit o a cualquier marco cartesiano equivalente. Si la magnitud es
+    casi cero devuelve el vector cero, igual que la utilidad historica
+    :func:`v_unit` que se conserva por compatibilidad.
+    """
+    return v_unit(v)
+
+
+def angle_between(
+    a: tuple[float, float, float],
+    b: tuple[float, float, float],
+) -> float:
+    """Retorna en grados el menor angulo entre dos vectores no nulos."""
+    a_unit = normalize(a)
+    b_unit = normalize(b)
+    if v_norm(a_unit) < 1e-12 or v_norm(b_unit) < 1e-12:
+        raise ValueError("No se puede calcular un angulo con un vector nulo")
+    return math.acos(clamp(v_dot(a_unit, b_unit), -1.0, 1.0)) * RAD
+
+
+def reflect_vector(
+    incident_direction: tuple[float, float, float],
+    normal: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    """Calcula la direccion reflejada mediante la ley de reflexion.
+
+    ``incident_direction`` es la direccion de propagacion *hacia* el espejo.
+    En este proyecto el vector solar ``S`` apunta del heliostato al Sol, por lo
+    que debe usarse ``incident_direction = -S``. ``normal`` apunta hacia la cara
+    reflectante. El resultado unitario se expresa en el mismo marco global
+    ``+x`` oeste, ``+y`` sur, ``+z`` cenit.
+
+    Lanza ``ValueError`` si la direccion incidente o la normal son nulas.
+    """
+    incident = normalize(incident_direction)
+    normal_unit = normalize(normal)
+    if v_norm(incident) < 1e-12 or v_norm(normal_unit) < 1e-12:
+        raise ValueError("La direccion incidente y la normal deben ser no nulas")
+    return normalize(v_sub(incident, v_mul(normal_unit, 2.0 * v_dot(incident, normal_unit))))
+
+
+def compute_heliostat_normal(
+    sun_direction: tuple[float, float, float],
+    target_direction: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    """Calcula la normal ideal como bisectriz entre Sol y objetivo.
+
+    ``sun_direction`` apunta del heliostato hacia el Sol y ``target_direction``
+    apunta del heliostato hacia el target. Ambas direcciones se normalizan. La
+    bisectriz ``normalize(S + T)`` satisface la ley de reflexion cuando el rayo
+    incidente usa la convencion de propagacion ``-S``.
+
+    Lanza ``ValueError`` para vectores nulos o direcciones exactamente opuestas,
+    porque en esos casos la bisectriz no queda definida de forma unica.
+    """
+    sun_unit = normalize(sun_direction)
+    target_unit = normalize(target_direction)
+    if v_norm(sun_unit) < 1e-12 or v_norm(target_unit) < 1e-12:
+        raise ValueError("Las direcciones solar y objetivo deben ser no nulas")
+    bisector = v_add(sun_unit, target_unit)
+    if v_norm(bisector) < 1e-12:
+        raise ValueError("Sol y objetivo opuestos no definen una bisectriz unica")
+    return normalize(bisector)
+
+
+@dataclass(frozen=True)
+class ReflectionDiagnostics:
+    """Vectores y angulos que permiten verificar la ley de reflexion."""
+
+    incident_direction: tuple[float, float, float]
+    reflected_direction: tuple[float, float, float]
+    incidence_angle_deg: float
+    reflection_angle_deg: float
+    target_difference_deg: float
+
+
+def compute_reflection_diagnostics(
+    sun_direction: tuple[float, float, float],
+    normal: tuple[float, float, float],
+    target_direction: tuple[float, float, float],
+) -> ReflectionDiagnostics:
+    """Evalua reflexion real y diferencia respecto de la direccion objetivo."""
+    sun_unit = normalize(sun_direction)
+    normal_unit = normalize(normal)
+    target_unit = normalize(target_direction)
+    if min(v_norm(sun_unit), v_norm(normal_unit), v_norm(target_unit)) < 1e-12:
+        raise ValueError("Los diagnosticos requieren tres vectores no nulos")
+    incident = v_mul(sun_unit, -1.0)
+    reflected = reflect_vector(incident, normal_unit)
+    return ReflectionDiagnostics(
+        incident,
+        reflected,
+        angle_between(sun_unit, normal_unit),
+        angle_between(reflected, normal_unit),
+        angle_between(reflected, target_unit),
+    )
+
+
+def intersect_ray_plane(
+    ray_origin: tuple[float, float, float],
+    ray_direction: tuple[float, float, float],
+    plane_point: tuple[float, float, float],
+    plane_normal: tuple[float, float, float],
+    epsilon: float = 1e-9,
+) -> tuple[tuple[float, float, float] | None, float | None]:
+    """Calcula la interseccion entre un rayo 3D y un plano.
+
+    Todos los puntos usan coordenadas globales en metros con la convencion del
+    proyecto: ``+x`` oeste, ``+y`` sur y ``+z`` cenit. Las direcciones se
+    normalizan internamente, por lo que ``t`` tambien queda expresado en metros.
+
+    Retorna ``(None, None)`` si una direccion es nula, si el rayo es paralelo al
+    plano o si el cruce queda detras del origen. Un cruce en el propio origen es
+    valido y retorna ``t = 0``.
+    """
+    if v_norm(ray_direction) < epsilon or v_norm(plane_normal) < epsilon:
+        return None, None
+    direction = v_unit(ray_direction)
+    normal = v_unit(plane_normal)
+    denominator = v_dot(direction, normal)
+    if abs(denominator) < epsilon:
+        return None, None
+    t = v_dot(v_sub(plane_point, ray_origin), normal) / denominator
+    if t < -epsilon:
+        return None, None
+    t = max(0.0, t)
+    return v_add(ray_origin, v_mul(direction, t)), t
+
+
+def world_to_target_coordinates(
+    point: tuple[float, float, float],
+    target_center: tuple[float, float, float],
+    target_u_axis: tuple[float, float, float],
+    target_v_axis: tuple[float, float, float],
+) -> tuple[float, float]:
+    """Convierte un punto global a coordenadas locales ``(u, v)`` del target.
+
+    Los puntos estan en metros y usan ``+x`` oeste, ``+y`` sur, ``+z`` cenit.
+    ``u`` es horizontal sobre el target y se orienta hacia el oeste para el
+    target nominal situado al sur. ``v`` es vertical y positivo hacia el cenit.
+    Los ejes se normalizan y ``v`` se ortogonaliza respecto de ``u``.
+
+    Lanza ``ValueError`` si alguno de los ejes no permite definir un marco 2D.
+    """
+    if v_norm(target_u_axis) < 1e-12 or v_norm(target_v_axis) < 1e-12:
+        raise ValueError("Los ejes locales del target no pueden ser nulos")
+    u_axis = v_unit(target_u_axis)
+    v_orthogonal = v_sub(target_v_axis, v_mul(u_axis, v_dot(target_v_axis, u_axis)))
+    if v_norm(v_orthogonal) < 1e-12:
+        raise ValueError("Los ejes locales del target no pueden ser paralelos")
+    v_axis = v_unit(v_orthogonal)
+    relative = v_sub(point, target_center)
+    return v_dot(relative, u_axis), v_dot(relative, v_axis)
+
+
+def target_coordinate_frame(
+    target_center: tuple[float, float, float],
+) -> tuple[
+    tuple[float, float, float],
+    tuple[float, float, float],
+    tuple[float, float, float],
+]:
+    """Construye normal, eje horizontal ``u`` y eje vertical ``v`` del target.
+
+    El plano mira desde el heliostato, situado en el origen optico, hacia el
+    centro del target. Para la geometria nominal al sur, ``u`` coincide con
+    ``+x`` (oeste) y ``v`` con ``+z`` (cenit). Si el target queda exactamente
+    sobre el eje vertical se elige un marco horizontal estable.
+    """
+    normal = v_unit(target_center)
+    if v_norm(normal) < 1e-12:
+        raise ValueError("El centro del target no puede coincidir con el origen optico")
+    global_up = (0.0, 0.0, 1.0)
+    u_axis = v_cross(normal, global_up)
+    if v_norm(u_axis) < 1e-12:
+        u_axis = (1.0, 0.0, 0.0)
+    else:
+        u_axis = v_unit(u_axis)
+    v_axis = v_sub(global_up, v_mul(normal, v_dot(global_up, normal)))
+    if v_norm(v_axis) < 1e-12:
+        v_axis = v_cross(normal, u_axis)
+    return normal, u_axis, v_unit(v_axis)
+
+
+def classify_target_error(radial_error_m: float, tolerance_m: float) -> str:
+    """Clasifica el impacto a partir del error radial y la tolerancia en metros."""
+    tolerance = max(0.0, tolerance_m)
+    centered_limit = max(1e-9, 0.25 * tolerance)
+    if radial_error_m <= centered_limit:
+        return "centrado"
+    if radial_error_m <= tolerance:
+        return "aceptable"
+    return "fuera de tolerancia"
+
+
+@dataclass(frozen=True)
+class TargetImpact:
+    """Resultado geometrico de proyectar un rayo sobre el target virtual."""
+
+    point: tuple[float, float, float] | None
+    ray_parameter_m: float | None
+    u_m: float | None
+    v_m: float | None
+    radial_error_m: float | None
+    angular_error_deg: float | None
+    status: str
+    plane_normal: tuple[float, float, float]
+    u_axis: tuple[float, float, float]
+    v_axis: tuple[float, float, float]
+
+
+def compute_target_impact(
+    ray_origin: tuple[float, float, float],
+    ray_direction: tuple[float, float, float],
+    target_center: tuple[float, float, float],
+    tolerance_m: float,
+) -> TargetImpact:
+    """Calcula impacto, coordenadas locales y errores del target virtual.
+
+    Las posiciones estan en metros en el marco global ``oeste/sur/cenit``. El
+    error angular es la aproximacion ``atan(error radial / distancia al centro)``.
+    Si no existe una interseccion frontal valida, las magnitudes del impacto son
+    ``None`` y el estado es ``sin impacto``.
+    """
+    normal, u_axis, v_axis = target_coordinate_frame(target_center)
+    point, ray_parameter = intersect_ray_plane(
+        ray_origin,
+        ray_direction,
+        target_center,
+        normal,
+    )
+    if point is None or ray_parameter is None:
+        return TargetImpact(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "sin impacto",
+            normal,
+            u_axis,
+            v_axis,
+        )
+    u_m, v_m = world_to_target_coordinates(point, target_center, u_axis, v_axis)
+    radial_error_m = math.hypot(u_m, v_m)
+    center_distance_m = v_norm(v_sub(target_center, ray_origin))
+    angular_error_deg = math.atan2(radial_error_m, max(center_distance_m, 1e-12)) * RAD
+    return TargetImpact(
+        point,
+        ray_parameter,
+        u_m,
+        v_m,
+        radial_error_m,
+        angular_error_deg,
+        classify_target_error(radial_error_m, tolerance_m),
+        normal,
+        u_axis,
+        v_axis,
+    )
 
 
 def normal_from_angles(acim_deg: float, elev_deg: float) -> tuple[float, float, float]:
@@ -329,6 +630,10 @@ class TwinState:
     method: str = "D&B"
     use_live_time: bool = True
     simulated_time: _dt.datetime = field(default_factory=_dt.datetime.now)
+    advance_solar_time: bool = True
+    solar_time_scale: float = 60.0
+    initial_simulated_time: _dt.datetime | None = None
+    simulation_step_s: float = 60.0
     rx: float = 0.0
     ry: float = 5.55
     rz: float = -0.40
@@ -340,6 +645,8 @@ class TwinState:
     camera_offset_acim: float = 0.0
     cdr: float = 0.07
     delay_s: float = 0.05
+    target_scale_m: float = 0.10
+    target_tolerance_m: float = 0.010
     mirror_size_m: float = 0.20
     base_width_m: float = 0.19
     fork_height_m: float = 0.22
@@ -349,6 +656,11 @@ class TwinState:
     tracking: bool = True
     automatic: bool = True
     free_mode: bool = False
+    show_sun_vector: bool = True
+    show_normal_vector: bool = True
+    show_reflected_vector: bool = True
+    show_target_direction: bool = True
+    show_target_line: bool = True
     running: bool = True
     iterations: int = 0
     az: AxisState = field(default_factory=lambda: AxisState("acim", limit_min=-95.0, limit_max=95.0))
@@ -364,12 +676,428 @@ class TwinState:
     target_saturated: bool = False
     spot_error_x: float = 0.0
     spot_error_z: float = 0.0
+    spot_error_u: float = 0.0
+    spot_error_v: float = 0.0
+    spot_error_radial: float = 0.0
+    spot_error_angular_deg: float = 0.0
+    spot_status: str = "centrado"
+    spot_valid: bool = True
+    spot_ray_t: float = 0.0
     spot_point: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    incident_direction: tuple[float, float, float] = (0.0, -1.0, 0.0)
+    reflected_direction: tuple[float, float, float] = (0.0, 1.0, 0.0)
+    incidence_angle_deg: float = 0.0
+    reflection_angle_deg: float = 0.0
+    reflection_target_error_deg: float = 0.0
+    target_plane_normal: tuple[float, float, float] = (0.0, 1.0, 0.0)
+    target_u_axis: tuple[float, float, float] = (1.0, 0.0, 0.0)
+    target_v_axis: tuple[float, float, float] = (0.0, 0.0, 1.0)
     sun_vector: tuple[float, float, float] = (0.0, 1.0, 0.0)
     target_vector: tuple[float, float, float] = (0.0, 1.0, 0.0)
     ideal_normal: tuple[float, float, float] = (0.0, 1.0, 0.0)
     actual_normal: tuple[float, float, float] = (0.0, 1.0, 0.0)
+    nominal_target_vector: tuple[float, float, float] = (0.0, 1.0, 0.0)
+    error_mode: str = "Ideal"
+    error_config: ErrorConfig = field(default_factory=ErrorConfig)
+    error_model: ErrorModel = field(init=False, repr=False)
+    correction_config: CorrectionConfig = field(default_factory=CorrectionConfig)
+    correction_model: CorrectionModel = field(init=False, repr=False)
+    drift_correction_az_deg: float = 0.0
+    drift_correction_el_deg: float = 0.0
+    drift_correction_pending: bool = False
+    drift_corrected_this_step: bool = False
+    facet_field_enabled: bool = False
+    facet_shape: str = "Cuadrada"
+    facet_count: int = 9
+    facet_rows: int = 3
+    facet_columns: int = 3
+    facet_spacing_m: float = 0.035
+    facet_gap_m: float = 0.003
+    facet_size_m: float = 0.030
+    facet_focal_distance_m: float = 0.250
+    facet_misaligned_id: str = "F5"
+    facet_horizontal_misalignment_deg: float = 0.0
+    facet_vertical_misalignment_deg: float = 0.0
+    facet_view_mode: str = "Resumen"
+    facet_active_ids: set[str] = field(
+        default_factory=lambda: {f"F{index}" for index in range(1, 10)}
+    )
+    facets: list[Facet] = field(default_factory=list)
+    facet_ray_results: list[FacetRayResult] = field(default_factory=list)
+    facet_focus: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    facet_receiver_normal: tuple[float, float, float] = (0.0, 1.0, 0.0)
+    facet_error_max_m: float = 0.0
+    facet_error_average_m: float = 0.0
+    facet_compute_ms: float = 0.0
+    _facet_previous_count: int = field(default=9, repr=False)
+    spot_map_enabled: bool = False
+    spot_base_sigma_m: float = 0.003
+    spot_map_half_size_m: float = 0.050
+    spot_map_resolution: int = 51
+    spot_normalization: str = "Total = 1"
+    spot_map_result: SpotMapResult | None = field(default=None, repr=False)
+    spot_metrics: SpotMetrics = field(default_factory=SpotMetrics)
+    spot_compute_ms: float = 0.0
+    motion_error_sample: MotionErrorSample = field(default_factory=MotionErrorSample)
+    ideal_spot_u: float = 0.0
+    ideal_spot_v: float = 0.0
+    ideal_spot_radial: float = 0.0
+    error_spot_u: float = 0.0
+    error_spot_v: float = 0.0
+    error_spot_radial: float = 0.0
+    corrected_spot_u: float = 0.0
+    corrected_spot_v: float = 0.0
+    corrected_spot_radial: float = 0.0
+    history_limit: int = 720
+    seconds_since_last_correction: float = 0.0
+    correction_count: int = 0
+    tracking_update_interval_s: float = 1.0
+    tracking_updates_manual: bool = False
+    seconds_since_tracking_update: float = 0.0
+    tracking_update_count: int = 0
+    tracking_schedule_initialized: bool = False
+    tracking_update_pending: bool = False
+    tracking_corrected_this_step: bool = False
+    held_target_acim: float = 0.0
+    held_target_elev: float = 0.0
+    tracking_error_max_m: float = 0.0
+    tracking_error_average_m: float = 0.0
+    tracking_error_rms_m: float = 0.0
+    _interval_error_max_m: float = field(default=0.0, repr=False)
+    _interval_error_sum_m: float = field(default=0.0, repr=False)
+    _interval_error_sq_sum_m: float = field(default=0.0, repr=False)
+    _interval_error_samples: int = field(default=0, repr=False)
+    _last_tracking_state: bool = field(default=True, repr=False)
     history: deque = field(default_factory=lambda: deque(maxlen=720))
+
+    def __post_init__(self) -> None:
+        """Inicializa el origen reiniciable del reloj simulado."""
+        self.error_model = ErrorModel(self.error_config)
+        self.correction_model = CorrectionModel(self.correction_config)
+        if self.initial_simulated_time is None:
+            self.initial_simulated_time = self.simulated_time
+        self.set_history_limit(self.history_limit)
+
+    def set_simulated_start_time(self, when: _dt.datetime) -> None:
+        """Define fecha/hora inicial y coloca el reloj exactamente en ella."""
+        self.initial_simulated_time = when
+        self.simulated_time = when
+        self.seconds_since_last_correction = 0.0
+        self.clear_history()
+        self.reset_tracking_schedule()
+        self.reset_drift_correction()
+
+    def reset_simulated_time(self) -> None:
+        """Regresa el reloj a la fecha/hora inicial configurada."""
+        if self.initial_simulated_time is None:
+            self.initial_simulated_time = self.simulated_time
+        self.simulated_time = self.initial_simulated_time
+        self.seconds_since_last_correction = 0.0
+        self.clear_history()
+        self.reset_tracking_schedule()
+        self.reset_drift_correction()
+
+    def step_simulated_time(self, seconds: float | None = None) -> float:
+        """Avanza manualmente una cantidad definida y devuelve ese avance."""
+        step_s = self.simulation_step_s if seconds is None else float(seconds)
+        step_s = max(0.0, step_s)
+        if self.use_live_time:
+            return 0.0
+        self.simulated_time += _dt.timedelta(seconds=step_s)
+        self.seconds_since_last_correction += step_s
+        self.seconds_since_tracking_update += step_s
+        return step_s
+
+    def advance_simulation_clock(self, real_elapsed_s: float) -> float:
+        """Avanza el reloj segun su multiplicador y devuelve segundos simulados."""
+        real_elapsed_s = max(0.0, float(real_elapsed_s))
+        if self.use_live_time:
+            return real_elapsed_s
+        if not self.advance_solar_time:
+            return 0.0
+        simulated_elapsed_s = real_elapsed_s * max(0.0, self.solar_time_scale)
+        self.simulated_time += _dt.timedelta(seconds=simulated_elapsed_s)
+        return simulated_elapsed_s
+
+    def set_history_limit(self, limit: int) -> None:
+        """Cambia el limite conservando las muestras mas recientes."""
+        bounded_limit = max(2, min(int(limit), 20000))
+        self.history_limit = bounded_limit
+        if self.history.maxlen != bounded_limit:
+            self.history = deque(self.history, maxlen=bounded_limit)
+
+    def clear_history(self) -> None:
+        """Elimina la trayectoria acumulada sin alterar el estado fisico."""
+        self.history.clear()
+
+    def mark_correction(self) -> None:
+        """Registra una actuacion de los ejes y reinicia su cronometro."""
+        self.seconds_since_last_correction = 0.0
+        self.correction_count += 1
+
+    def configure_tracking_updates(self, interval_s: float | None) -> None:
+        """Configura intervalo automatico o modo manual y reinicia su ciclo."""
+        manual = interval_s is None
+        new_interval = self.tracking_update_interval_s if manual else max(0.001, float(interval_s))
+        if manual != self.tracking_updates_manual or abs(new_interval - self.tracking_update_interval_s) > 1e-12:
+            self.tracking_updates_manual = manual
+            self.tracking_update_interval_s = new_interval
+            self.reset_tracking_schedule()
+
+    def reset_tracking_schedule(self) -> None:
+        """Reinicia contador, temporizador, target retenido y estadisticas."""
+        self.seconds_since_tracking_update = 0.0
+        self.tracking_update_count = 0
+        self.tracking_schedule_initialized = False
+        self.tracking_update_pending = False
+        self.tracking_corrected_this_step = False
+        self.held_target_acim = self.az.angle_deg
+        self.held_target_elev = self.el.angle_deg
+        self.tracking_error_max_m = 0.0
+        self.tracking_error_average_m = 0.0
+        self.tracking_error_rms_m = 0.0
+        self._reset_interval_error_accumulators()
+
+    def request_tracking_update(self) -> None:
+        """Solicita una correccion para el siguiente paso del simulador."""
+        self.tracking_update_pending = True
+
+    def reset_drift_correction(self) -> None:
+        """Borra la compensacion dinamica sin cambiar los errores simulados."""
+        self.correction_model.reset()
+        self.drift_correction_az_deg = 0.0
+        self.drift_correction_el_deg = 0.0
+        self.drift_correction_pending = False
+        self.drift_corrected_this_step = False
+
+    def request_drift_correction(self) -> None:
+        """Solicita una observacion/correccion del impacto en el siguiente paso."""
+        self.drift_correction_pending = True
+
+    def _update_drift_correction(self, simulated_elapsed_s: float) -> None:
+        """Actualiza una vez la estrategia activa usando el impacto observado."""
+        target_distance_m = v_norm(self.scenario_target_vector("Con error"))
+        correction_az, correction_el = self.correction_model.update(
+            simulated_elapsed_s=simulated_elapsed_s,
+            observed_u_m=self.corrected_spot_u,
+            observed_v_m=self.corrected_spot_v,
+            target_distance_m=target_distance_m,
+            # "Impacto observado" es deliberadamente manual: solo el boton
+            # solicita una captura. La estrategia de camara conserva su propio
+            # temporizador automatico dentro de CorrectionModel.
+            observation_trigger=False,
+            force=self.drift_correction_pending,
+        )
+        self.drift_correction_az_deg = correction_az
+        self.drift_correction_el_deg = correction_el
+        self.drift_corrected_this_step = self.correction_model.corrected_this_step
+        self.drift_correction_pending = False
+
+    def _reset_interval_error_accumulators(self) -> None:
+        self._interval_error_max_m = 0.0
+        self._interval_error_sum_m = 0.0
+        self._interval_error_sq_sum_m = 0.0
+        self._interval_error_samples = 0
+
+    def _accumulate_tracking_error(self) -> None:
+        if not self.spot_valid or not math.isfinite(self.spot_error_radial):
+            return
+        error_m = max(0.0, self.spot_error_radial)
+        self._interval_error_max_m = max(self._interval_error_max_m, error_m)
+        self._interval_error_sum_m += error_m
+        self._interval_error_sq_sum_m += error_m * error_m
+        self._interval_error_samples += 1
+
+    def _finish_tracking_interval(self) -> None:
+        if self._interval_error_samples:
+            count = self._interval_error_samples
+            self.tracking_error_max_m = self._interval_error_max_m
+            self.tracking_error_average_m = self._interval_error_sum_m / count
+            self.tracking_error_rms_m = math.sqrt(self._interval_error_sq_sum_m / count)
+        self._reset_interval_error_accumulators()
+
+    def _apply_tracking_update(self) -> None:
+        """Captura la normal solar actual y aplica una correccion instantanea."""
+        if self.tracking_schedule_initialized:
+            self._finish_tracking_interval()
+        self.held_target_acim = self.target_acim
+        self.held_target_elev = self.target_elev
+        az_delta = wrap_deg(self.held_target_acim - self.az.angle_deg)
+        el_delta = self.held_target_elev - self.el.angle_deg
+        self.motion_error_sample = self.error_model.sample_motion(az_delta, el_delta)
+        self.az.target_deg = self.held_target_acim
+        self.el.target_deg = self.held_target_elev
+        if self.az.motor_on:
+            self.az.angle_deg = clamp(self.held_target_acim, self.az.limit_min, self.az.limit_max)
+            self.az.counts = int(round(self.az.angle_deg * self.az.counts_per_degree))
+        if self.el.motor_on:
+            self.el.angle_deg = clamp(self.held_target_elev, self.el.limit_min, self.el.limit_max)
+            self.el.counts = int(round(self.el.angle_deg * self.el.counts_per_degree))
+        self.az.ina = self.az.inb = self.el.ina = self.el.inb = 0
+        self.seconds_since_tracking_update = 0.0
+        self.tracking_update_count += 1
+        self.tracking_schedule_initialized = True
+        self.tracking_update_pending = False
+        self.tracking_corrected_this_step = True
+        self.mark_correction()
+
+    def resample_motion_errors(self, az_delta_deg: float = 0.0, el_delta_deg: float = 0.0) -> None:
+        """Genera una nueva muestra controlada para ruido y errores de sentido."""
+        self.motion_error_sample = self.error_model.sample_motion(az_delta_deg, el_delta_deg)
+
+    def _scenario_uses_errors(self, mode: str) -> bool:
+        return mode.strip().lower() != "ideal"
+
+    def scenario_target_vector(self, mode: str) -> tuple[float, float, float]:
+        """Devuelve el target nominal o el target fisico perturbado."""
+        return self.error_model.effective_target(
+            self.nominal_target_vector,
+            self._scenario_uses_errors(mode),
+        )
+
+    def scenario_normal(self, mode: str) -> tuple[float, float, float]:
+        """Devuelve la normal comandada ideal, con error o compensada."""
+        corrected = mode.strip().lower() == "corregido"
+        command_az = self.az.angle_deg
+        command_el = self.el.angle_deg + self.peralte
+        if corrected:
+            command_az += self.drift_correction_az_deg
+            command_el += self.drift_correction_el_deg
+        return self.error_model.normal_from_command(
+            command_az,
+            command_el,
+            self.motion_error_sample,
+            include_errors=self._scenario_uses_errors(mode),
+            corrected=corrected,
+        )
+
+    def _scenario_impact(
+        self,
+        mode: str,
+    ) -> tuple[float, float, float]:
+        """Calcula u, v y error radial para un escenario comparable."""
+        normal = self.scenario_normal(mode)
+        target = self.scenario_target_vector(mode)
+        try:
+            diagnostics = compute_reflection_diagnostics(self.sun_vector, normal, target)
+            impact = compute_target_impact(
+                (0.0, 0.0, 0.0),
+                diagnostics.reflected_direction,
+                target,
+                self.target_tolerance_m,
+            )
+        except ValueError:
+            impact = None
+        if impact is None or impact.point is None:
+            return (float("nan"), float("nan"), float("nan"))
+        return (impact.u_m, impact.v_m, impact.radial_error_m)
+
+    def compute_error_comparison(self) -> None:
+        """Actualiza simultaneamente los casos ideal, con error y corregido."""
+        self.ideal_spot_u, self.ideal_spot_v, self.ideal_spot_radial = self._scenario_impact("Ideal")
+        self.error_spot_u, self.error_spot_v, self.error_spot_radial = self._scenario_impact("Con error")
+        (
+            self.corrected_spot_u,
+            self.corrected_spot_v,
+            self.corrected_spot_radial,
+        ) = self._scenario_impact("Corregido")
+
+    def compute_facet_field(self) -> None:
+        """Construye y traza el concentrador 3x3 con un rayo por faceta."""
+        if not self.facet_field_enabled:
+            self.facets = []
+            self.facet_ray_results = []
+            self.facet_error_max_m = 0.0
+            self.facet_error_average_m = 0.0
+            self.facet_compute_ms = 0.0
+            self.spot_map_result = None
+            self.spot_metrics = SpotMetrics()
+            self.spot_compute_ms = 0.0
+            return
+        started = time.perf_counter()
+        concentrator_center = self.scenario_target_vector(self.error_mode)
+        axis = v_unit(concentrator_center)
+        if v_norm(axis) < 1e-12:
+            self.facets = []
+            self.facet_ray_results = []
+            self.facet_error_max_m = float("nan")
+            self.facet_error_average_m = float("nan")
+            self.facet_compute_ms = (time.perf_counter() - started) * 1000.0
+            self.spot_map_result = None
+            self.spot_metrics = SpotMetrics()
+            self.spot_compute_ms = 0.0
+            return
+        focal_distance = max(0.001, float(self.facet_focal_distance_m))
+        self.facet_focus = v_sub(concentrator_center, v_mul(axis, focal_distance))
+        self.facet_receiver_normal = axis
+        self.facets = build_compact_facets(
+            concentrator_center=concentrator_center,
+            focus=self.facet_focus,
+            count=self.facet_count,
+            shape=self.facet_shape,
+            size_m=max(0.001, float(self.facet_size_m)),
+            gap_m=max(0.0, float(self.facet_gap_m)),
+            focal_distance_m=focal_distance,
+            active_ids=set(self.facet_active_ids),
+            misaligned_facet_id=self.facet_misaligned_id,
+            horizontal_misalignment_deg=self.facet_horizontal_misalignment_deg,
+            vertical_misalignment_deg=self.facet_vertical_misalignment_deg,
+        )
+        self.facet_ray_results = trace_facets(
+            self.facets,
+            heliostat_origin=(0.0, 0.0, 0.0),
+            receiver_center=self.facet_focus,
+            receiver_normal=self.facet_receiver_normal,
+        )
+        errors = [
+            result.focus_error_m
+            for result in self.facet_ray_results
+            if math.isfinite(result.focus_error_m)
+        ]
+        self.facet_error_max_m = max(errors, default=0.0)
+        self.facet_error_average_m = sum(errors) / len(errors) if errors else 0.0
+        self.facet_compute_ms = (time.perf_counter() - started) * 1000.0
+        self.compute_spot_distribution()
+
+    def compute_spot_distribution(self) -> None:
+        """Superpone las manchas de las facetas activas sobre el receptor."""
+        if not self.spot_map_enabled or not self.facet_ray_results:
+            self.spot_map_result = None
+            self.spot_metrics = SpotMetrics()
+            self.spot_compute_ms = 0.0
+            return
+        started = time.perf_counter()
+        facet_by_id = {facet.id: facet for facet in self.facets}
+        contributions = []
+        for result in self.facet_ray_results:
+            facet = facet_by_id.get(result.facet_id)
+            if facet is None:
+                continue
+            if facet.shape == "Circular":
+                area_factor = math.pi / 4.0
+            elif facet.shape == "Hexagonal":
+                area_factor = math.sqrt(3.0) / 2.0
+            else:
+                area_factor = 1.0
+            receiver_cosine = abs(
+                v_dot(v_unit(result.reflected_direction), v_unit(self.facet_receiver_normal))
+            )
+            contribution = contribution_from_ray(
+                result,
+                receiver_normal=self.facet_receiver_normal,
+                base_sigma_m=max(1e-5, float(self.spot_base_sigma_m)),
+                weight=area_factor * receiver_cosine,
+            )
+            if contribution is not None:
+                contributions.append(contribution)
+        self.spot_map_result = generate_spot_map(
+            contributions,
+            half_size_m=max(0.001, float(self.spot_map_half_size_m)),
+            resolution=self.spot_map_resolution,
+            normalization=self.spot_normalization,
+        )
+        self.spot_metrics = self.spot_map_result.metrics
+        self.spot_compute_ms = (time.perf_counter() - started) * 1000.0
 
     def target_vector_scaled(self) -> tuple[float, float, float]:
         """Devuelve el vector R hacia el concentrador en escala real o maqueta."""
@@ -400,78 +1128,217 @@ class TwinState:
             math.cos(alt) * math.cos(az),
             math.sin(alt),
         )
-        self.target_vector = self.target_vector_scaled()
-        t_unit = v_unit(self.target_vector)
-        self.ideal_normal = v_unit(v_add(self.sun_vector, t_unit))
+        self.nominal_target_vector = self.target_vector_scaled()
+        t_unit = normalize(self.nominal_target_vector)
+        try:
+            self.ideal_normal = compute_heliostat_normal(self.sun_vector, t_unit)
+        except ValueError:
+            self.ideal_normal = (0.0, 0.0, 0.0)
         acim, elev = angles_from_normal(self.ideal_normal)
         self.raw_target_acim = wrap_deg(acim + self.offset_acim + self.camera_offset_acim)
         self.raw_target_elev = elev + self.peralte + self.offset_ele + self.camera_offset_ele
         self.target_acim = self.raw_target_acim
         self.target_elev = clamp(self.raw_target_elev, 0.0, 90.0)
         self.target_saturated = abs(self.raw_target_elev - self.target_elev) > 1e-6
-        self.actual_normal = normal_from_angles(self.az.angle_deg, self.el.angle_deg + self.peralte)
+        self.target_vector = self.scenario_target_vector(self.error_mode)
+        self.actual_normal = self.scenario_normal(self.error_mode)
         self.compute_spot_error()
+        self.compute_error_comparison()
+        self.compute_facet_field()
 
     def compute_spot_error(self) -> None:
-        """Calcula donde cae el rayo reflejado sobre el plano del target.
+        """Calcula el cruce real del rayo reflejado con el target virtual.
 
         Usa la ley de reflexion:
             reflejado = incidente - 2 * dot(incidente, normal) * normal
 
-        Luego intersecta ese rayo con el eje hacia el target y proyecta el error
-        en una pantalla local. Los errores X/Z se guardan en metros.
+        El target es un plano que pasa por ``target_vector`` y cuya normal apunta
+        desde el origen optico hacia su centro. Su eje ``u`` es horizontal y
+        positivo hacia el oeste; ``v`` es vertical y positivo hacia el cenit.
+        Todas las posiciones y errores lineales se guardan en metros.
         """
-        t_unit = v_unit(self.target_vector)
-        incoming = v_mul(self.sun_vector, -1.0)
-        reflected = v_sub(incoming, v_mul(self.actual_normal, 2.0 * v_dot(incoming, self.actual_normal)))
-        denom = v_dot(reflected, t_unit)
-        if abs(denom) < 1e-9:
+        try:
+            diagnostics = compute_reflection_diagnostics(
+                self.sun_vector,
+                self.actual_normal,
+                self.target_vector,
+            )
+            self.incident_direction = diagnostics.incident_direction
+            self.reflected_direction = diagnostics.reflected_direction
+            self.incidence_angle_deg = diagnostics.incidence_angle_deg
+            self.reflection_angle_deg = diagnostics.reflection_angle_deg
+            self.reflection_target_error_deg = diagnostics.target_difference_deg
+            impact = compute_target_impact(
+                (0.0, 0.0, 0.0),
+                self.reflected_direction,
+                self.target_vector,
+                self.target_tolerance_m,
+            )
+        except ValueError:
+            self.incident_direction = v_mul(normalize(self.sun_vector), -1.0)
+            self.reflected_direction = (float("nan"), float("nan"), float("nan"))
+            self.incidence_angle_deg = float("nan")
+            self.reflection_angle_deg = float("nan")
+            self.reflection_target_error_deg = float("nan")
+            impact = None
+        if impact is None or impact.point is None:
             self.spot_point = (float("nan"), float("nan"), float("nan"))
-            self.spot_error_x = 0.0
-            self.spot_error_z = 0.0
+            self.spot_error_x = self.spot_error_z = float("nan")
+            self.spot_error_u = self.spot_error_v = float("nan")
+            self.spot_error_radial = float("nan")
+            self.spot_error_angular_deg = float("nan")
+            self.spot_status = "sin impacto"
+            self.spot_valid = False
+            self.spot_ray_t = float("nan")
             return
-        distance = v_dot(self.target_vector, t_unit) / denom
-        self.spot_point = v_mul(reflected, distance)
-        error_vec = v_sub(self.spot_point, self.target_vector)
-        screen_x = v_unit(v_cross((0.0, 0.0, 1.0), t_unit))
-        if v_norm(screen_x) < 1e-9:
-            screen_x = (1.0, 0.0, 0.0)
-        screen_z = v_unit(v_cross(t_unit, screen_x))
-        self.spot_error_x = v_dot(error_vec, screen_x)
-        self.spot_error_z = v_dot(error_vec, screen_z)
+        self.spot_point = impact.point
+        self.spot_ray_t = float(impact.ray_parameter_m)
+        self.spot_error_u = float(impact.u_m)
+        self.spot_error_v = float(impact.v_m)
+        self.spot_error_radial = float(impact.radial_error_m)
+        self.spot_error_angular_deg = float(impact.angular_error_deg)
+        self.spot_status = impact.status
+        self.spot_valid = True
+        self.target_plane_normal = impact.plane_normal
+        self.target_u_axis = impact.u_axis
+        self.target_v_axis = impact.v_axis
+        # Alias conservados para no romper historiales, replay ni CSV previos.
+        self.spot_error_x = self.spot_error_u
+        self.spot_error_z = self.spot_error_v
 
     def update(self, dt: float, target_override: tuple[float, float] | None = None) -> None:
         """Avanza un paso temporal de la simulacion.
 
-        Si target_override existe, por ejemplo en modo Home, se usa ese objetivo
-        angular en lugar del calculado por Sol/target. Si el modo automatico y
-        seguimiento estan activos, mueve los ejes suavemente hacia el objetivo.
+        En seguimiento automatico el Sol se recalcula siempre, pero el target
+        retenido y la pose solo cambian al vencer el intervalo configurado. El
+        modo Home conserva su movimiento suave independiente del programador.
         """
         if not self.running:
             return
+        dt = max(0.0, float(dt))
+        solar_elapsed_s = self.advance_simulation_clock(dt)
+
+        # Al apagar seguimiento se congela la pose mecanica, pero el reloj y
+        # la posicion solar siguen avanzando. Este desacoplamiento produce la
+        # deriva fisica del rayo reflejado sobre el target.
+        if self._last_tracking_state and not self.tracking:
+            self.seconds_since_last_correction = 0.0
+        elif not self._last_tracking_state and self.tracking:
+            self.reset_tracking_schedule()
+        self._last_tracking_state = self.tracking
+        self.tracking_corrected_this_step = False
+        self.drift_corrected_this_step = False
+
         self.compute_geometry()
         if target_override:
+            self.tracking_schedule_initialized = False
             self.az.target_deg = target_override[0]
             self.el.target_deg = target_override[1]
+            previous_az = self.az.angle_deg
+            previous_el = self.el.angle_deg
+            if self.automatic and not self.free_mode:
+                self.az.update_closed_loop(dt, self.cdr)
+                self.el.update_closed_loop(dt, self.cdr)
+            if (
+                abs(self.az.angle_deg - previous_az) > 1e-9
+                or abs(self.el.angle_deg - previous_el) > 1e-9
+            ):
+                self.mark_correction()
+            else:
+                self.seconds_since_last_correction += solar_elapsed_s
+        elif self.automatic and self.tracking and not self.free_mode:
+            if not self.tracking_schedule_initialized:
+                self._apply_tracking_update()
+            else:
+                self.seconds_since_tracking_update += solar_elapsed_s
+                self.seconds_since_last_correction = self.seconds_since_tracking_update
+                self._accumulate_tracking_error()
+                interval_due = (
+                    not self.tracking_updates_manual
+                    and self.seconds_since_tracking_update + 1e-9 >= self.tracking_update_interval_s
+                )
+                if self.tracking_update_pending or interval_due:
+                    self._apply_tracking_update()
+            self.az.target_deg = self.held_target_acim
+            self.el.target_deg = self.held_target_elev
+            self.az.ina = self.az.inb = self.el.ina = self.el.inb = 0
         else:
             self.az.target_deg = self.target_acim
             self.el.target_deg = self.target_elev
-        if self.automatic and (self.tracking or target_override is not None) and not self.free_mode:
-            self.az.update_closed_loop(dt, self.cdr)
-            self.el.update_closed_loop(dt, self.cdr)
-        else:
             self.az.ina = self.az.inb = self.el.ina = self.el.inb = 0
+            self.seconds_since_last_correction += solar_elapsed_s
+            if self.tracking_schedule_initialized:
+                self.seconds_since_tracking_update += solar_elapsed_s
+        # Los motores pueden cambiar la normal durante este mismo paso. El
+        # impacto se vuelve a calcular para que la pantalla no lleve un ciclo de
+        # retraso respecto de los angulos mostrados.
+        self.target_vector = self.scenario_target_vector(self.error_mode)
+        self.actual_normal = self.scenario_normal(self.error_mode)
+        self.compute_spot_error()
+        self.compute_error_comparison()
+        # La estrategia observa el impacto corregido anterior y actualiza una
+        # sola vez por paso. Luego se recalculan los tres escenarios para que
+        # la interfaz muestre inmediatamente el efecto de la compensacion.
+        self._update_drift_correction(solar_elapsed_s)
+        self.target_vector = self.scenario_target_vector(self.error_mode)
+        self.actual_normal = self.scenario_normal(self.error_mode)
+        self.compute_spot_error()
+        self.compute_error_comparison()
         self.iterations += 1
+        self.set_history_limit(self.history_limit)
         self.history.append(
             {
                 "t": self.iterations,
+                "solar_time": (
+                    _dt.datetime.now() if self.use_live_time else self.simulated_time
+                ).isoformat(timespec="milliseconds"),
+                "elapsed_since_correction_s": self.seconds_since_last_correction,
+                "elapsed_since_tracking_update_s": self.seconds_since_tracking_update,
+                "tracking_update_count": self.tracking_update_count,
+                "tracking_corrected": self.tracking_corrected_this_step,
+                "tracking_interval_s": (
+                    "manual" if self.tracking_updates_manual else self.tracking_update_interval_s
+                ),
+                "tracking_error_max_m": self.tracking_error_max_m,
+                "tracking_error_average_m": self.tracking_error_average_m,
+                "tracking_error_rms_m": self.tracking_error_rms_m,
+                "error_mode": self.error_mode,
+                "ideal_spot_radial": self.ideal_spot_radial,
+                "error_spot_radial": self.error_spot_radial,
+                "corrected_spot_radial": self.corrected_spot_radial,
+                "drift_correction_strategy": self.correction_config.strategy,
+                "drift_correction_az_deg": self.drift_correction_az_deg,
+                "drift_correction_el_deg": self.drift_correction_el_deg,
+                "drift_correction_count": self.correction_model.update_count,
+                "drift_corrected": self.drift_corrected_this_step,
+                "facet_field_enabled": self.facet_field_enabled,
+                "facet_shape": self.facet_shape,
+                "facet_count": self.facet_count,
+                "facet_active_count": len(self.facet_ray_results),
+                "facet_error_max_m": self.facet_error_max_m,
+                "facet_error_average_m": self.facet_error_average_m,
+                "facet_compute_ms": self.facet_compute_ms,
+                "spot_map_enabled": self.spot_map_enabled,
+                "spot_centroid_error_m": self.spot_metrics.centroid_error_m,
+                "spot_maximum_intensity": self.spot_metrics.maximum_intensity,
+                "spot_equivalent_diameter_m": self.spot_metrics.equivalent_diameter_m,
+                "spot_shape": self.spot_metrics.shape,
+                "spot_compute_ms": self.spot_compute_ms,
+                "tracking": self.tracking,
                 "az": self.az.angle_deg,
                 "el": self.el.angle_deg,
                 "az_target": self.az.target_deg,
                 "el_target": self.el.target_deg,
                 "err_x": self.spot_error_x,
                 "err_z": self.spot_error_z,
+                "err_u": self.spot_error_u,
+                "err_v": self.spot_error_v,
+                "err_radial": self.spot_error_radial,
+                "spot_valid": self.spot_valid,
                 "spot": self.spot_point,
+                "incidence_deg": self.incidence_angle_deg,
+                "reflection_deg": self.reflection_angle_deg,
+                "reflection_target_deg": self.reflection_target_error_deg,
             }
         )
 
@@ -604,6 +1471,10 @@ class DigitalTwinApp:
         self.replay_index = 0
         self.last_status_label = ""
         self.invalid_time_text = ""
+        self.last_time_input: tuple[str, str] | None = None
+        self.last_specific_time_enabled = False
+        self.last_tracking_enabled = self.state.tracking
+        self.last_tracking_interval_choice = "1 s"
         self.state.automatic = False
         self.state.free_mode = True
         self.set_home_pose_instant()
@@ -667,7 +1538,91 @@ class DigitalTwinApp:
         self.var("automatic", self.state.automatic)
         self.var("free_mode", self.state.free_mode)
         self.var("specific_time", not self.state.use_live_time)
+        self.var("advance_solar_time", self.state.advance_solar_time)
+        self.var("time_scale_choice", f"{self.state.solar_time_scale:g}x")
+        self.var("tracking_interval_choice", self.last_tracking_interval_choice)
         self.var("scale_to_model", self.state.scale_to_model)
+        self.var("error_mode", self.state.error_mode)
+        for error_name in (
+            "enable_elevation_offset",
+            "elevation_offset_deg",
+            "enable_azimuth_offset",
+            "azimuth_offset_deg",
+            "enable_north_south_misalignment",
+            "north_south_misalignment_deg",
+            "enable_target_position_error",
+            "target_error_x_m",
+            "target_error_y_m",
+            "target_error_z_m",
+            "enable_heliostat_position_error",
+            "heliostat_error_x_m",
+            "heliostat_error_y_m",
+            "heliostat_error_z_m",
+            "enable_peralte_error",
+            "peralte_error_deg",
+            "enable_backlash",
+            "backlash_deg",
+            "enable_directional_error",
+            "upward_error_deg",
+            "downward_error_deg",
+            "enable_random_noise",
+            "random_noise_std_deg",
+            "random_seed",
+            "correction_azimuth_deg",
+            "correction_elevation_deg",
+        ):
+            self.var(f"error_{error_name}", getattr(self.state.error_config, error_name))
+        for correction_name in (
+            "enabled",
+            "strategy",
+            "constant_az_deg",
+            "constant_el_deg",
+            "time_az_rate_deg_per_hour",
+            "time_el_rate_deg_per_hour",
+            "polynomial_az_c0",
+            "polynomial_az_c1",
+            "polynomial_az_c2",
+            "polynomial_el_c0",
+            "polynomial_el_c1",
+            "polynomial_el_c2",
+            "image_gain_az",
+            "image_gain_el",
+            "image_max_step_deg",
+            "camera_interval_s",
+        ):
+            self.var(
+                f"correction_{correction_name}",
+                getattr(self.state.correction_config, correction_name),
+            )
+        for facet_name in (
+            "facet_field_enabled",
+            "facet_shape",
+            "facet_count",
+            "facet_gap_m",
+            "facet_size_m",
+            "facet_focal_distance_m",
+            "facet_misaligned_id",
+            "facet_horizontal_misalignment_deg",
+            "facet_vertical_misalignment_deg",
+            "facet_view_mode",
+        ):
+            self.var(facet_name, getattr(self.state, facet_name))
+        for spot_name in (
+            "spot_map_enabled",
+            "spot_base_sigma_m",
+            "spot_map_half_size_m",
+            "spot_map_resolution",
+            "spot_normalization",
+        ):
+            self.var(spot_name, getattr(self.state, spot_name))
+        for name in (
+            "show_sun_vector",
+            "show_normal_vector",
+            "show_reflected_vector",
+            "show_target_direction",
+            "show_target_line",
+        ):
+            self.var(name, getattr(self.state, name))
         self.var("method", self.state.method)
         self.var("view_mode", "Isometrica")
         self.var("mode_status", "MODO ACTIVO: MANUAL / MOVIMIENTO LIBRE")
@@ -686,6 +1641,9 @@ class DigitalTwinApp:
             "camera_offset_acim",
             "cdr",
             "delay_s",
+            "simulation_step_s",
+            "target_scale_m",
+            "target_tolerance_m",
             "mirror_size_m",
             "base_width_m",
             "fork_height_m",
@@ -694,6 +1652,7 @@ class DigitalTwinApp:
             "uncertainty_gain",
         ):
             self.var(name, getattr(self.state, name))
+        self.var("history_limit", self.state.history_limit)
         self.var("az_limit_min", self.state.az.limit_min)
         self.var("az_limit_max", self.state.az.limit_max)
         self.var("el_limit_min", self.state.el.limit_min)
@@ -732,9 +1691,15 @@ class DigitalTwinApp:
 
         ttk.Label(left, text="Sistema de Control Horno Solar IER - Gemelo Digital", style="Title.TLabel").pack(fill="x", padx=10, pady=(10, 8))
         self.build_mode_block(left)
+        self.build_time_block(left)
         self.build_motor_block(left)
         self.build_geometry_block(left)
         self.build_auto_block(left)
+        self.build_vector_block(left)
+        self.build_error_block(left)
+        self.build_correction_block(left)
+        self.build_facet_block(left)
+        self.build_spot_block(left)
         self.build_calibration_block(left)
         self.build_status_block(left)
 
@@ -745,12 +1710,22 @@ class DigitalTwinApp:
         self.scene_canvas = tk.Canvas(notebook, bg="#101821", highlightthickness=0)
         self.receiver_canvas = tk.Canvas(notebook, bg="#f4f4f4", highlightthickness=0)
         self.solar_canvas = tk.Canvas(notebook, bg="#f4f4f4", highlightthickness=0)
+        self.drift_canvas = tk.Canvas(notebook, bg="#f4f4f4", highlightthickness=0)
+        self.error_canvas = tk.Canvas(notebook, bg="#f4f4f4", highlightthickness=0)
+        self.correction_canvas = tk.Canvas(notebook, bg="#f4f4f4", highlightthickness=0)
+        self.facet_canvas = tk.Canvas(notebook, bg="#f4f4f4", highlightthickness=0)
+        self.spot_canvas = tk.Canvas(notebook, bg="#101821", highlightthickness=0)
         self.diagnostic_canvas = tk.Canvas(notebook, bg="#f4f4f4", highlightthickness=0)
         self.logic_canvas = tk.Canvas(notebook, bg="#f7f7f7", highlightthickness=0)
         self.log_canvas = tk.Canvas(notebook, bg="#f7f7f7", highlightthickness=0)
         notebook.add(self.scene_canvas, text="Gemelo 3D")
         notebook.add(self.receiver_canvas, text="Pantalla / spot")
         notebook.add(self.solar_canvas, text="Trayectoria solar")
+        notebook.add(self.drift_canvas, text="Deriva temporal")
+        notebook.add(self.error_canvas, text="Comparacion de errores")
+        notebook.add(self.correction_canvas, text="Correccion de deriva")
+        notebook.add(self.facet_canvas, text="Facetas / rayos")
+        notebook.add(self.spot_canvas, text="Mapa de intensidad")
         notebook.add(self.diagnostic_canvas, text="Diagnostico")
         notebook.add(self.logic_canvas, text="Flujo del gemelo")
         notebook.add(self.log_canvas, text="Eventos")
@@ -781,12 +1756,71 @@ class DigitalTwinApp:
         date_row.columnconfigure(3, weight=1)
         ttk.Label(
             frame,
-            text="Fecha especifica ON usa estos campos; OFF usa fecha y hora actuales.",
+            text=(
+                "Fecha especifica ON inicia en estos campos. Con 'Avanzar tiempo solar' "
+                "el reloj continua desde ese instante."
+            ),
             style="Small.TLabel",
+            wraplength=450,
+            justify="left",
         ).pack(anchor="w", padx=12, pady=(0, 8))
         for i in range(3):
             row.columnconfigure(i, weight=1)
         self.update_mode_visuals()
+
+    def build_time_block(self, parent: ttk.Frame) -> None:
+        """Construye los controles independientes del reloj solar simulado."""
+        frame = ttk.LabelFrame(parent, text="Reloj de simulacion", style="Block.TLabelframe")
+        frame.pack(fill="x", padx=10, pady=5)
+        grid = ttk.Frame(frame, style="Panel.TFrame")
+        grid.pack(fill="x", padx=8, pady=7)
+        self.add_switch(grid, "Reloj simulado", "advance_solar_time", row=0, col=0)
+        ttk.Label(grid, text="Multiplicador", style="Small.TLabel").grid(row=0, column=2, sticky="w", padx=2, pady=2)
+        ttk.OptionMenu(
+            grid,
+            self.vars["time_scale_choice"],
+            self.vars["time_scale_choice"].get(),
+            "1x",
+            "10x",
+            "60x",
+            "120x",
+            "600x",
+            command=lambda _=None: self.apply_controls(),
+        ).grid(row=0, column=3, sticky="ew", padx=2, pady=2)
+        self.add_entry(grid, "Paso manual (s)", "simulation_step_s", 1, 0)
+        ttk.Button(
+            grid,
+            text="AVANZAR PASO",
+            style="Gold.TButton",
+            command=self.step_simulation_clock,
+        ).grid(row=1, column=2, columnspan=2, sticky="ew", padx=3, pady=3)
+        ttk.Button(
+            grid,
+            text="PAUSAR / REANUDAR",
+            style="Manual.TButton",
+            command=self.toggle_simulation_clock,
+        ).grid(row=2, column=0, columnspan=2, sticky="ew", padx=3, pady=3)
+        ttk.Button(
+            grid,
+            text="REINICIAR TIEMPO",
+            style="Gold.TButton",
+            command=self.reset_simulation_clock,
+        ).grid(row=2, column=2, columnspan=2, sticky="ew", padx=3, pady=3)
+        ttk.Button(
+            grid,
+            text="APLICAR FECHA/HORA INICIAL",
+            style="Gold.TButton",
+            command=self.apply_initial_datetime,
+        ).grid(row=3, column=0, columnspan=4, sticky="ew", padx=3, pady=3)
+        self.clock_status_label = ttk.Label(
+            grid,
+            text="",
+            style="Readout.TLabel",
+            anchor="center",
+        )
+        self.clock_status_label.grid(row=4, column=0, columnspan=4, sticky="ew", padx=3, pady=(6, 2))
+        for col in (1, 3):
+            grid.columnconfigure(col, weight=1)
 
     def build_motor_block(self, parent: ttk.Frame) -> None:
         """Construye controles manuales de motores y perillas de velocidad."""
@@ -863,9 +1897,35 @@ class DigitalTwinApp:
         grid.pack(fill="x", padx=8, pady=7)
         self.add_switch(grid, "Seguimiento", "tracking", row=0, col=0)
         self.add_switch(grid, "Escalar R a maqueta", "scale_to_model", row=0, col=2)
-        self.add_entry(grid, "Consideracion (+/- cdr)", "cdr", 1, 0)
-        self.add_entry(grid, "Refresco (s)", "delay_s", 1, 2)
-        ttk.Label(grid, text="Vista 3D", style="Small.TLabel").grid(row=2, column=0, sticky="w", pady=2, padx=2)
+        ttk.Label(grid, text="Actualizar cada", style="Small.TLabel").grid(row=1, column=0, sticky="w", padx=2, pady=2)
+        ttk.OptionMenu(
+            grid,
+            self.vars["tracking_interval_choice"],
+            self.vars["tracking_interval_choice"].get(),
+            "1 s",
+            "5 s",
+            "10 s",
+            "30 s",
+            "60 s",
+            "Manual",
+            command=lambda _=None: self.apply_controls(),
+        ).grid(row=1, column=1, sticky="ew", padx=2, pady=2)
+        ttk.Button(
+            grid,
+            text="CORREGIR AHORA",
+            style="Gold.TButton",
+            command=self.request_tracking_correction,
+        ).grid(row=1, column=2, columnspan=2, sticky="ew", padx=4, pady=3)
+        self.add_entry(grid, "Consideracion (+/- cdr)", "cdr", 2, 0)
+        self.add_entry(grid, "Refresco (s)", "delay_s", 2, 2)
+        self.add_entry(grid, "Limite historial", "history_limit", 3, 0)
+        ttk.Button(
+            grid,
+            text="Limpiar trayectoria",
+            style="Gold.TButton",
+            command=self.clear_spot_history,
+        ).grid(row=3, column=2, columnspan=2, sticky="ew", padx=4, pady=3)
+        ttk.Label(grid, text="Vista 3D", style="Small.TLabel").grid(row=4, column=0, sticky="w", pady=2, padx=2)
         ttk.OptionMenu(
             grid,
             self.vars["view_mode"],
@@ -875,9 +1935,306 @@ class DigitalTwinApp:
             "Lateral",
             "Superior",
             command=lambda _=None: self.apply_controls(),
-        ).grid(row=2, column=1, sticky="ew", pady=2, padx=2)
+        ).grid(row=4, column=1, sticky="ew", pady=2, padx=2)
         grid.columnconfigure(1, weight=1)
         grid.columnconfigure(3, weight=1)
+
+    def build_vector_block(self, parent: ttk.Frame) -> None:
+        """Construye controles independientes de visibilidad para la vista 3D."""
+        frame = ttk.LabelFrame(parent, text="Vectores geometricos visibles", style="Block.TLabelframe")
+        frame.pack(fill="x", padx=10, pady=5)
+        grid = ttk.Frame(frame, style="Panel.TFrame")
+        grid.pack(fill="x", padx=8, pady=7)
+        controls = (
+            ("Solar incidente", "show_sun_vector", 0, 0),
+            ("Normal heliostato", "show_normal_vector", 0, 2),
+            ("Rayo reflejado", "show_reflected_vector", 1, 0),
+            ("Direccion objetivo", "show_target_direction", 1, 2),
+            ("Linea heliostato-target", "show_target_line", 2, 0),
+        )
+        for label, varname, row, col in controls:
+            self.add_switch(grid, label, varname, row=row, col=col)
+        for col in range(4):
+            grid.columnconfigure(col, weight=1)
+
+    def build_error_block(self, parent: ttk.Frame) -> None:
+        """Construye activadores y parametros del modelo de errores."""
+        frame = ttk.LabelFrame(parent, text="Errores geometricos y mecanicos", style="Block.TLabelframe")
+        frame.pack(fill="x", padx=10, pady=5)
+        grid = ttk.Frame(frame, style="Panel.TFrame")
+        grid.pack(fill="x", padx=8, pady=7)
+        ttk.Label(grid, text="Caso mostrado", style="Small.TLabel").grid(row=0, column=0, sticky="w", padx=2, pady=2)
+        ttk.OptionMenu(
+            grid,
+            self.vars["error_mode"],
+            self.vars["error_mode"].get(),
+            "Ideal",
+            "Con error",
+            "Corregido",
+            command=lambda _=None: self.apply_controls(),
+        ).grid(row=0, column=1, columnspan=3, sticky="ew", padx=2, pady=2)
+
+        self.add_switch(grid, "Offset elevacion", "error_enable_elevation_offset", row=1, col=0)
+        self.add_entry(grid, "deg", "error_elevation_offset_deg", 1, 2)
+        self.add_switch(grid, "Offset acimut", "error_enable_azimuth_offset", row=2, col=0)
+        self.add_entry(grid, "deg", "error_azimuth_offset_deg", 2, 2)
+        self.add_switch(grid, "Eje norte-sur", "error_enable_north_south_misalignment", row=3, col=0)
+        self.add_entry(grid, "deg", "error_north_south_misalignment_deg", 3, 2)
+
+        self.add_switch(grid, "Error posicion target", "error_enable_target_position_error", row=4, col=0)
+        self.add_entry(grid, "X (m)", "error_target_error_x_m", 4, 2)
+        self.add_entry(grid, "Y (m)", "error_target_error_y_m", 5, 0)
+        self.add_entry(grid, "Z (m)", "error_target_error_z_m", 5, 2)
+
+        self.add_switch(grid, "Error coord. helio", "error_enable_heliostat_position_error", row=6, col=0)
+        self.add_entry(grid, "X (m)", "error_heliostat_error_x_m", 6, 2)
+        self.add_entry(grid, "Y (m)", "error_heliostat_error_y_m", 7, 0)
+        self.add_entry(grid, "Z (m)", "error_heliostat_error_z_m", 7, 2)
+
+        self.add_switch(grid, "Error peralte", "error_enable_peralte_error", row=8, col=0)
+        self.add_entry(grid, "deg", "error_peralte_error_deg", 8, 2)
+        self.add_switch(grid, "Backlash", "error_enable_backlash", row=9, col=0)
+        self.add_entry(grid, "deg", "error_backlash_deg", 9, 2)
+        self.add_switch(grid, "Error subida/bajada", "error_enable_directional_error", row=10, col=0)
+        self.add_entry(grid, "Subida deg", "error_upward_error_deg", 10, 2)
+        self.add_entry(grid, "Bajada deg", "error_downward_error_deg", 11, 2)
+        self.add_switch(grid, "Ruido aleatorio", "error_enable_random_noise", row=12, col=0)
+        self.add_entry(grid, "Sigma deg", "error_random_noise_std_deg", 12, 2)
+        self.add_entry(grid, "Semilla", "error_random_seed", 13, 0)
+        ttk.Button(
+            grid,
+            text="NUEVA MUESTRA",
+            style="Gold.TButton",
+            command=self.resample_errors,
+        ).grid(row=13, column=2, columnspan=2, sticky="ew", padx=3, pady=3)
+
+        ttk.Label(grid, text="Compensacion manual para caso Corregido", style="Small.TLabel").grid(
+            row=14, column=0, columnspan=4, sticky="w", padx=2, pady=(7, 2)
+        )
+        self.add_entry(grid, "Corr. acimut deg", "error_correction_azimuth_deg", 15, 0)
+        self.add_entry(grid, "Corr. elev. deg", "error_correction_elevation_deg", 15, 2)
+        ttk.Label(
+            grid,
+            text="XYZ usa +x oeste, +y sur, +z cenit. Cada switch es independiente.",
+            style="Small.TLabel",
+            wraplength=450,
+            justify="left",
+        ).grid(row=16, column=0, columnspan=4, sticky="ew", padx=2, pady=(5, 2))
+        for col in (1, 3):
+            grid.columnconfigure(col, weight=1)
+
+    def build_correction_block(self, parent: ttk.Frame) -> None:
+        """Construye las cinco estrategias progresivas de correccion de deriva."""
+        frame = ttk.LabelFrame(parent, text="Correccion de deriva", style="Block.TLabelframe")
+        frame.pack(fill="x", padx=10, pady=5)
+        grid = ttk.Frame(frame, style="Panel.TFrame")
+        grid.pack(fill="x", padx=8, pady=7)
+        self.add_switch(grid, "Activar correccion", "correction_enabled", row=0, col=0)
+        ttk.Label(grid, text="Estrategia", style="Small.TLabel").grid(
+            row=1, column=0, sticky="w", padx=2, pady=2
+        )
+        ttk.OptionMenu(
+            grid,
+            self.vars["correction_strategy"],
+            self.vars["correction_strategy"].get(),
+            *CorrectionModel.STRATEGIES,
+            command=lambda _=None: self.apply_controls(),
+        ).grid(row=1, column=1, columnspan=3, sticky="ew", padx=2, pady=2)
+
+        ttk.Label(grid, text="Offset constante", style="Small.TLabel").grid(
+            row=2, column=0, columnspan=4, sticky="w", padx=2, pady=(6, 2)
+        )
+        self.add_entry(grid, "AZ deg", "correction_constant_az_deg", 3, 0)
+        self.add_entry(grid, "EL deg", "correction_constant_el_deg", 3, 2)
+
+        ttk.Label(grid, text="Dependiente del tiempo", style="Small.TLabel").grid(
+            row=4, column=0, columnspan=4, sticky="w", padx=2, pady=(6, 2)
+        )
+        self.add_entry(grid, "AZ deg/h", "correction_time_az_rate_deg_per_hour", 5, 0)
+        self.add_entry(grid, "EL deg/h", "correction_time_el_rate_deg_per_hour", 5, 2)
+
+        ttk.Label(grid, text="Polinomio c0 + c1*t + c2*t^2 (t en horas)", style="Small.TLabel").grid(
+            row=6, column=0, columnspan=4, sticky="w", padx=2, pady=(6, 2)
+        )
+        self.add_entry(grid, "AZ c0", "correction_polynomial_az_c0", 7, 0)
+        self.add_entry(grid, "AZ c1", "correction_polynomial_az_c1", 7, 2)
+        self.add_entry(grid, "AZ c2", "correction_polynomial_az_c2", 8, 0)
+        self.add_entry(grid, "EL c0", "correction_polynomial_el_c0", 8, 2)
+        self.add_entry(grid, "EL c1", "correction_polynomial_el_c1", 9, 0)
+        self.add_entry(grid, "EL c2", "correction_polynomial_el_c2", 9, 2)
+
+        ttk.Label(grid, text="Impacto observado / camara", style="Small.TLabel").grid(
+            row=10, column=0, columnspan=4, sticky="w", padx=2, pady=(6, 2)
+        )
+        self.add_entry(grid, "Ganancia AZ", "correction_image_gain_az", 11, 0)
+        self.add_entry(grid, "Ganancia EL", "correction_image_gain_el", 11, 2)
+        self.add_entry(grid, "Paso max deg", "correction_image_max_step_deg", 12, 0)
+        self.add_entry(grid, "Camara cada s", "correction_camera_interval_s", 12, 2)
+
+        buttons = ttk.Frame(grid, style="Panel.TFrame")
+        buttons.grid(row=13, column=0, columnspan=4, sticky="ew", pady=(7, 2))
+        ttk.Button(
+            buttons,
+            text="CORREGIR DESDE IMPACTO",
+            style="Gold.TButton",
+            command=self.request_drift_correction,
+        ).pack(side="left", fill="x", expand=True, padx=(0, 3))
+        ttk.Button(
+            buttons,
+            text="RESET CORRECCION",
+            style="Manual.TButton",
+            command=self.reset_drift_correction,
+        ).pack(side="left", fill="x", expand=True, padx=(3, 0))
+        self.correction_status_label = ttk.Label(
+            grid,
+            text="Sin correccion dinamica",
+            style="Small.TLabel",
+            wraplength=450,
+            justify="left",
+        )
+        self.correction_status_label.grid(
+            row=14, column=0, columnspan=4, sticky="ew", padx=2, pady=(5, 2)
+        )
+        for col in (1, 3):
+            grid.columnconfigure(col, weight=1)
+
+    def build_facet_block(self, parent: ttk.Frame) -> None:
+        """Construye forma, cantidad y controles del concentrador facetado."""
+        frame = ttk.LabelFrame(parent, text="Concentrador facetado", style="Block.TLabelframe")
+        frame.pack(fill="x", padx=10, pady=5)
+        grid = ttk.Frame(frame, style="Panel.TFrame")
+        grid.pack(fill="x", padx=8, pady=7)
+        self.add_switch(grid, "Activar modelo", "facet_field_enabled", row=0, col=0)
+        ttk.OptionMenu(
+            grid,
+            self.vars["facet_shape"],
+            self.vars["facet_shape"].get(),
+            "Cuadrada",
+            "Circular",
+            "Hexagonal",
+            command=lambda _=None: self.apply_controls(),
+        ).grid(row=1, column=2, columnspan=2, sticky="ew", padx=2, pady=(7, 2))
+        ttk.Label(grid, text="Forma", style="Small.TLabel").grid(
+            row=1, column=0, sticky="w", padx=2, pady=(7, 2)
+        )
+        self.add_entry(grid, "Numero facetas", "facet_count", 2, 0)
+        self.add_entry(grid, "Tamano (m)", "facet_size_m", 2, 2)
+        self.add_entry(grid, "Separacion extra (m)", "facet_gap_m", 3, 0)
+        self.add_entry(grid, "Distancia focal (m)", "facet_focal_distance_m", 3, 2)
+        ttk.Label(
+            grid,
+            text="Selecciona una faceta por ID para desalinearla o cambiar su estado",
+            style="Small.TLabel",
+        ).grid(row=4, column=0, columnspan=4, sticky="w", padx=2, pady=(7, 2))
+        self.add_entry(grid, "ID (ej. F12)", "facet_misaligned_id", 5, 0)
+        self.add_entry(grid, "Desalin. horiz deg", "facet_horizontal_misalignment_deg", 5, 2)
+        self.add_entry(grid, "Desalin. vert deg", "facet_vertical_misalignment_deg", 6, 0)
+        selected_buttons = ttk.Frame(grid, style="Panel.TFrame")
+        selected_buttons.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(7, 2))
+        ttk.Button(
+            selected_buttons,
+            text="ACTIVAR SELECCIONADA",
+            style="Gold.TButton",
+            command=lambda: self.set_selected_facet_active(True),
+        ).pack(side="left", fill="x", expand=True, padx=(0, 3))
+        ttk.Button(
+            selected_buttons,
+            text="DESACTIVAR SELECCIONADA",
+            style="Manual.TButton",
+            command=lambda: self.set_selected_facet_active(False),
+        ).pack(side="left", fill="x", expand=True, padx=(3, 0))
+        buttons = ttk.Frame(grid, style="Panel.TFrame")
+        buttons.grid(row=8, column=0, columnspan=4, sticky="ew", pady=(3, 2))
+        ttk.Button(
+            buttons,
+            text="TODAS ON",
+            style="Gold.TButton",
+            command=lambda: self.set_all_facets_active(True),
+        ).pack(side="left", fill="x", expand=True, padx=(0, 3))
+        ttk.Button(
+            buttons,
+            text="TODAS OFF",
+            style="Manual.TButton",
+            command=lambda: self.set_all_facets_active(False),
+        ).pack(side="left", fill="x", expand=True, padx=(3, 0))
+        self.facet_status_label = ttk.Label(
+            grid,
+            text="Modelo de facetas desactivado",
+            style="Small.TLabel",
+            wraplength=450,
+            justify="left",
+        )
+        self.facet_status_label.grid(
+            row=9, column=0, columnspan=4, sticky="ew", padx=2, pady=(5, 2)
+        )
+        ttk.Label(
+            grid,
+            text=(
+                "Cuadradas: reticula compacta. Circulares y hexagonales: "
+                "empaquetamiento triangular centrado. Tamano = lado cuadrado, "
+                "diametro circular o ancho entre caras del hexagono."
+            ),
+            style="Small.TLabel",
+            wraplength=450,
+            justify="left",
+        ).grid(row=10, column=0, columnspan=4, sticky="ew", padx=2, pady=(2, 2))
+        ttk.Label(grid, text="Vista del esquema", style="Small.TLabel").grid(
+            row=11, column=0, sticky="w", padx=2, pady=(6, 2)
+        )
+        ttk.OptionMenu(
+            grid,
+            self.vars["facet_view_mode"],
+            self.vars["facet_view_mode"].get(),
+            "Resumen",
+            "Superior X-Y",
+            "Lateral Y-Z",
+            "3D isometrica",
+            command=lambda _=None: self.apply_controls(),
+        ).grid(row=11, column=1, columnspan=3, sticky="ew", padx=2, pady=(6, 2))
+        for col in (1, 3):
+            grid.columnconfigure(col, weight=1)
+
+    def build_spot_block(self, parent: ttk.Frame) -> None:
+        """Construye controles del mapa aproximado de intensidad por faceta."""
+        frame = ttk.LabelFrame(parent, text="Spot aproximado por faceta", style="Block.TLabelframe")
+        frame.pack(fill="x", padx=10, pady=5)
+        grid = ttk.Frame(frame, style="Panel.TFrame")
+        grid.pack(fill="x", padx=8, pady=7)
+        self.add_switch(grid, "Activar mapa", "spot_map_enabled", row=0, col=0)
+        self.add_entry(grid, "Sigma base (m)", "spot_base_sigma_m", 1, 0)
+        self.add_entry(grid, "Rango +/- (m)", "spot_map_half_size_m", 1, 2)
+        self.add_entry(grid, "Resolucion impar", "spot_map_resolution", 2, 0)
+        ttk.Label(grid, text="Normalizacion", style="Small.TLabel").grid(
+            row=2, column=2, sticky="w", padx=2, pady=2
+        )
+        ttk.OptionMenu(
+            grid,
+            self.vars["spot_normalization"],
+            self.vars["spot_normalization"].get(),
+            "Total = 1",
+            "Pico = 1",
+            "Sin normalizar",
+            command=lambda _=None: self.apply_controls(),
+        ).grid(row=2, column=3, sticky="ew", padx=2, pady=2)
+        self.spot_status_label = ttk.Label(
+            grid,
+            text="Mapa de intensidad desactivado",
+            style="Small.TLabel",
+            wraplength=450,
+            justify="left",
+        )
+        self.spot_status_label.grid(
+            row=3, column=0, columnspan=4, sticky="ew", padx=2, pady=(6, 2)
+        )
+        ttk.Label(
+            grid,
+            text="Cada impacto genera una gaussiana; la incidencia oblicua la alarga.",
+            style="Small.TLabel",
+            wraplength=450,
+            justify="left",
+        ).grid(row=4, column=0, columnspan=4, sticky="ew", padx=2, pady=(2, 2))
+        for col in (1, 3):
+            grid.columnconfigure(col, weight=1)
 
     def build_calibration_block(self, parent: ttk.Frame) -> None:
         """Construye parametros de calibracion visual y de movimiento simulado.
@@ -895,28 +2252,30 @@ class DigitalTwinApp:
         self.add_entry(grid, "Horquilla alto (m)", "fork_height_m", 2, 0)
         self.add_entry(grid, "Riel largo (m)", "rail_length_m", 2, 2)
         self.add_entry(grid, "Pantalla diam. (m)", "receiver_screen_m", 3, 0)
-        self.add_entry(grid, "Zona cdr x", "uncertainty_gain", 3, 2)
+        self.add_entry(grid, "Escala target +/- (m)", "target_scale_m", 3, 2)
+        self.add_entry(grid, "Tolerancia target (m)", "target_tolerance_m", 4, 0)
+        self.add_entry(grid, "Zona cdr x", "uncertainty_gain", 4, 2)
         ttk.Label(
             grid,
-            text="Estos valores solo ajustan la apariencia y la zona de tolerancia visual.",
+            text="La escala controla el rango visible del target; la tolerancia define la zona aceptable.",
             style="Small.TLabel",
             wraplength=440,
             justify="left",
-        ).grid(row=4, column=0, columnspan=4, sticky="ew", padx=2, pady=(2, 8))
-        ttk.Label(grid, text="Limites y velocidad del movimiento simulado", style="Small.TLabel").grid(row=5, column=0, columnspan=4, sticky="w", padx=2, pady=(2, 4))
-        self.add_entry(grid, "Acimut min (deg)", "az_limit_min", 6, 0)
-        self.add_entry(grid, "Acimut max (deg)", "az_limit_max", 6, 2)
-        self.add_entry(grid, "Elev min (deg)", "el_limit_min", 7, 0)
-        self.add_entry(grid, "Elev max (deg)", "el_limit_max", 7, 2)
-        self.add_entry(grid, "Vel acimut (deg/s)", "az_deg_per_second", 8, 0)
-        self.add_entry(grid, "Vel elev (deg/s)", "el_deg_per_second", 8, 2)
+        ).grid(row=5, column=0, columnspan=4, sticky="ew", padx=2, pady=(2, 8))
+        ttk.Label(grid, text="Limites y velocidad del movimiento simulado", style="Small.TLabel").grid(row=6, column=0, columnspan=4, sticky="w", padx=2, pady=(2, 4))
+        self.add_entry(grid, "Acimut min (deg)", "az_limit_min", 7, 0)
+        self.add_entry(grid, "Acimut max (deg)", "az_limit_max", 7, 2)
+        self.add_entry(grid, "Elev min (deg)", "el_limit_min", 8, 0)
+        self.add_entry(grid, "Elev max (deg)", "el_limit_max", 8, 2)
+        self.add_entry(grid, "Vel acimut (deg/s)", "az_deg_per_second", 9, 0)
+        self.add_entry(grid, "Vel elev (deg/s)", "el_deg_per_second", 9, 2)
         ttk.Label(
             grid,
             text="Los conteos de encoder se mantienen internos porque vienen de la escala del VI/LabVIEW y no suelen requerir ajuste manual.",
             style="Small.TLabel",
             wraplength=440,
             justify="left",
-        ).grid(row=9, column=0, columnspan=4, sticky="ew", padx=2, pady=(4, 2))
+        ).grid(row=10, column=0, columnspan=4, sticky="ew", padx=2, pady=(4, 2))
         for col in (1, 3):
             grid.columnconfigure(col, weight=1)
 
@@ -946,10 +2305,19 @@ class DigitalTwinApp:
             ("Acimut Target + Offset", "target_acim"),
             ("Counter Ele", "el_counts"),
             ("Counter Acim", "az_counts"),
-            ("Spot X/Z mm", "spot"),
+            ("Impacto U/V mm", "spot"),
             ("Error angular", "angular_error"),
+            ("Incidencia / Reflexion", "optical_angles"),
+            ("Reflejado vs objetivo", "reflection_target_error"),
             ("Limites", "limit_status"),
             ("Estado motores", "motor_status"),
+            ("Desde ultima correccion", "correction_elapsed"),
+            ("Intervalo de seguimiento", "tracking_interval"),
+            ("Correcciones programadas", "tracking_update_count"),
+            ("Error max/prom/RMS", "tracking_error_stats"),
+            ("Caso de errores", "error_case"),
+            ("Radial ideal/error/corr.", "error_comparison"),
+            ("Historial deriva", "history_status"),
             ("Iteraciones", "iterations"),
         ]
         for row, (label, key) in enumerate(labels):
@@ -1043,6 +2411,8 @@ class DigitalTwinApp:
             messages.append(("critica", self.invalid_time_text))
         if s.altitude <= 0.0:
             messages.append(("critica", "Sol bajo horizonte: geometria no operativa"))
+        if not s.spot_valid:
+            messages.append(("critica", "El rayo reflejado no intersecta el target al frente"))
         az_err, el_err = self.axis_errors()
         if self.current_mode in ("auto", "home") and (abs(az_err) > s.cdr or abs(el_err) > s.cdr):
             if not s.az.motor_on or not s.el.motor_on:
@@ -1102,6 +2472,7 @@ class DigitalTwinApp:
             self.vars["automatic"].set(True)
             self.vars["free_mode"].set(False)
             self.vars["mode_status"].set("MODO ACTIVO: AUTOMATICO")
+            self.state.reset_tracking_schedule()
             self.log_event("Modo automatico")
         elif mode == "manual":
             self.vars["automatic"].set(False)
@@ -1144,6 +2515,124 @@ class DigitalTwinApp:
         self.home_position()
         self.state.iterations = 0
         self.log_event("Reset de iteraciones y retorno a home")
+
+    def clear_spot_history(self) -> None:
+        """Borra la trayectoria y las curvas de deriva acumuladas."""
+        removed = len(self.state.history)
+        self.state.clear_history()
+        self.log_event(f"Trayectoria limpiada ({removed} muestras)")
+
+    def request_tracking_correction(self) -> None:
+        """Solicita una actualizacion inmediata de la orientacion retenida."""
+        self.apply_controls()
+        if not self.state.automatic or self.state.free_mode or not self.state.tracking:
+            self.log_event("Correccion requiere modo Automatico y Seguimiento ON")
+            return
+        self.state.request_tracking_update()
+        self.log_event("Correccion manual solicitada")
+
+    def resample_errors(self) -> None:
+        """Genera otra muestra de ruido sin cambiar la configuracion."""
+        self.apply_controls()
+        self.state.resample_motion_errors()
+        self.state.compute_geometry()
+        self.log_event("Nueva muestra de errores aleatorios")
+
+    def request_drift_correction(self) -> None:
+        """Solicita una actualizacion basada en el impacto observado."""
+        self.apply_controls()
+        if not self.state.correction_config.enabled:
+            self.log_event("Activa Correccion de deriva antes de corregir")
+            return
+        if self.state.correction_config.strategy not in (
+            "Impacto observado",
+            "Camara periodica",
+        ):
+            self.log_event("El boton de impacto requiere estrategia observada o camara")
+            return
+        self.state.request_drift_correction()
+        self.log_event("Correccion desde impacto solicitada")
+
+    def reset_drift_correction(self) -> None:
+        """Reinicia la compensacion y su historial de actualizaciones."""
+        self.state.reset_drift_correction()
+        self.log_event("Correccion de deriva reiniciada")
+
+    def set_all_facets_active(self, active: bool) -> None:
+        """Activa o desactiva todas las contribuciones configuradas."""
+        self.apply_controls()
+        self.state.facet_active_ids = (
+            {f"F{index}" for index in range(1, self.state.facet_count + 1)}
+            if active
+            else set()
+        )
+        self.state.compute_geometry()
+        self.log_event("Todas las facetas activadas" if active else "Todas las facetas desactivadas")
+
+    def set_selected_facet_active(self, active: bool) -> None:
+        """Cambia el estado de la faceta escrita en el campo de seleccion."""
+        self.apply_controls()
+        facet_id = self.state.facet_misaligned_id.strip().upper()
+        valid_ids = {f"F{index}" for index in range(1, self.state.facet_count + 1)}
+        if facet_id not in valid_ids:
+            self.log_event(f"ID de faceta fuera de rango: {facet_id or '(vacio)'}")
+            return
+        if active:
+            self.state.facet_active_ids.add(facet_id)
+        else:
+            self.state.facet_active_ids.discard(facet_id)
+        self.state.compute_geometry()
+        self.log_event(f"{facet_id} {'activada' if active else 'desactivada'}")
+
+    def apply_initial_datetime(self) -> None:
+        """Aplica los campos de fecha/hora como nuevo origen de simulacion."""
+        date_text = str(self.vars["date_text"].get()).strip()
+        time_text = str(self.vars["time_text"].get()).strip()
+        try:
+            when = _dt.datetime.fromisoformat(f"{date_text}T{time_text}")
+        except ValueError:
+            self.invalid_time_text = "Fecha/hora especifica invalida"
+            self.log_event(self.invalid_time_text)
+            return
+        self.vars["specific_time"].set(True)
+        self.state.use_live_time = False
+        self.state.set_simulated_start_time(when)
+        self.last_time_input = (date_text, time_text)
+        self.last_specific_time_enabled = True
+        self.invalid_time_text = ""
+        self.log_event(f"Tiempo inicial aplicado: {when:%Y-%m-%d %H:%M:%S}")
+
+    def toggle_simulation_clock(self) -> None:
+        """Pausa o reanuda solamente el reloj, sin detener la interfaz."""
+        if not bool(self.vars["specific_time"].get()):
+            self.log_event("El control del reloj requiere Fecha especifica ON")
+            return
+        running = not bool(self.vars["advance_solar_time"].get())
+        self.vars["advance_solar_time"].set(running)
+        self.state.advance_solar_time = running
+        self.log_event("Reloj simulado reanudado" if running else "Reloj simulado pausado")
+
+    def reset_simulation_clock(self) -> None:
+        """Reinicia el reloj en el origen definido y limpia su trayectoria."""
+        self.apply_controls()
+        if self.state.use_live_time:
+            self.log_event("Reinicio de tiempo requiere Fecha especifica ON")
+            return
+        self.state.reset_simulated_time()
+        self.state.compute_geometry()
+        self.log_event(f"Reloj reiniciado: {self.state.simulated_time:%Y-%m-%d %H:%M:%S}")
+
+    def step_simulation_clock(self) -> None:
+        """Pausa el reloj y ejecuta un avance manual de tamaño configurable."""
+        self.apply_controls()
+        if self.state.use_live_time:
+            self.log_event("Avance por paso requiere Fecha especifica ON")
+            return
+        self.vars["advance_solar_time"].set(False)
+        self.state.advance_solar_time = False
+        advanced_s = self.state.step_simulated_time()
+        self.state.compute_geometry()
+        self.log_event(f"Paso de tiempo: +{advanced_s:g} s")
 
     def toggle_run(self) -> None:
         """Pausa o reanuda la simulacion sin cerrar la interfaz."""
@@ -1200,12 +2689,17 @@ class DigitalTwinApp:
         # Metodo solar y fecha/hora activa. Si "Fecha especifica" esta OFF,
         # siempre se usa la hora real del sistema.
         self.state.method = str(self.vars["method"].get())
-        self.state.use_live_time = not bool(self.vars["specific_time"].get())
+        specific_time_enabled = bool(self.vars["specific_time"].get())
+        self.state.use_live_time = not specific_time_enabled
         if not self.state.use_live_time:
             try:
                 date_text = str(self.vars["date_text"].get()).strip()
                 time_text = str(self.vars["time_text"].get()).strip()
-                self.state.simulated_time = _dt.datetime.fromisoformat(f"{date_text}T{time_text}")
+                time_input = (date_text, time_text)
+                if time_input != self.last_time_input or not self.last_specific_time_enabled:
+                    when = _dt.datetime.fromisoformat(f"{date_text}T{time_text}")
+                    self.state.set_simulated_start_time(when)
+                    self.last_time_input = time_input
                 if self.invalid_time_text:
                     self.log_event("Fecha especifica valida restaurada")
                 self.invalid_time_text = ""
@@ -1215,6 +2709,108 @@ class DigitalTwinApp:
                 self.invalid_time_text = "Fecha/hora especifica invalida"
         else:
             self.invalid_time_text = ""
+        self.last_specific_time_enabled = specific_time_enabled
+
+        tracking_enabled = bool(self.state.tracking)
+        if tracking_enabled != self.last_tracking_enabled:
+            if tracking_enabled:
+                self.log_event("Seguimiento reanudado")
+            else:
+                self.log_event("Seguimiento detenido: pose mecanica congelada")
+            self.last_tracking_enabled = tracking_enabled
+
+        interval_choice = str(self.vars["tracking_interval_choice"].get()).strip()
+        if interval_choice.lower() == "manual":
+            self.state.configure_tracking_updates(None)
+        else:
+            interval_text = interval_choice.lower().strip()
+            if interval_text.endswith("s"):
+                interval_text = interval_text[:-1].strip()
+            interval_value = float(interval_text)
+            self.state.configure_tracking_updates(interval_value)
+        self.last_tracking_interval_choice = interval_choice
+
+        config = self.state.error_config
+        for var_name, var in self.vars.items():
+            if not var_name.startswith("error_"):
+                continue
+            config_name = var_name[len("error_") :]
+            if not hasattr(config, config_name):
+                continue
+            try:
+                value = var.get()
+                current = getattr(config, config_name)
+                if isinstance(current, bool):
+                    setattr(config, config_name, bool(value))
+                elif isinstance(current, int):
+                    setattr(config, config_name, int(value))
+                else:
+                    setattr(config, config_name, float(value))
+            except (tk.TclError, TypeError, ValueError):
+                pass
+        config.backlash_deg = max(0.0, float(config.backlash_deg))
+        config.random_noise_std_deg = max(0.0, float(config.random_noise_std_deg))
+
+        correction_config = self.state.correction_config
+        for var_name, var in self.vars.items():
+            if not var_name.startswith("correction_"):
+                continue
+            config_name = var_name[len("correction_") :]
+            if not hasattr(correction_config, config_name):
+                continue
+            try:
+                value = var.get()
+                current = getattr(correction_config, config_name)
+                if isinstance(current, bool):
+                    setattr(correction_config, config_name, bool(value))
+                elif isinstance(current, str):
+                    setattr(correction_config, config_name, str(value))
+                else:
+                    setattr(correction_config, config_name, float(value))
+            except (tk.TclError, TypeError, ValueError):
+                pass
+        correction_config.image_max_step_deg = max(
+            0.0, float(correction_config.image_max_step_deg)
+        )
+        correction_config.camera_interval_s = max(
+            0.001, float(correction_config.camera_interval_s)
+        )
+
+        new_facet_count = max(1, min(int(self.state.facet_count), 61))
+        self.vars["facet_count"].set(new_facet_count)
+        previous_facet_count = self.state._facet_previous_count
+        if new_facet_count > previous_facet_count:
+            self.state.facet_active_ids.update(
+                f"F{index}" for index in range(previous_facet_count + 1, new_facet_count + 1)
+            )
+        valid_facet_ids = {f"F{index}" for index in range(1, new_facet_count + 1)}
+        self.state.facet_active_ids.intersection_update(valid_facet_ids)
+        self.state.facet_count = new_facet_count
+        self.state._facet_previous_count = new_facet_count
+        if self.state.facet_shape not in ("Cuadrada", "Circular", "Hexagonal"):
+            self.state.facet_shape = "Cuadrada"
+        self.state.facet_gap_m = max(0.0, float(self.state.facet_gap_m))
+        self.state.facet_size_m = max(0.001, float(self.state.facet_size_m))
+        self.state.facet_focal_distance_m = max(
+            0.001, float(self.state.facet_focal_distance_m)
+        )
+        self.state.facet_misaligned_id = self.state.facet_misaligned_id.strip().upper() or "F1"
+
+        self.state.spot_base_sigma_m = max(1e-5, float(self.state.spot_base_sigma_m))
+        self.state.spot_map_half_size_m = max(
+            0.001, float(self.state.spot_map_half_size_m)
+        )
+        spot_resolution = max(21, min(int(self.state.spot_map_resolution), 121))
+        if spot_resolution % 2 == 0:
+            spot_resolution += 1
+        self.state.spot_map_resolution = spot_resolution
+        self.vars["spot_map_resolution"].set(spot_resolution)
+        if self.state.spot_normalization not in (
+            "Total = 1",
+            "Pico = 1",
+            "Sin normalizar",
+        ):
+            self.state.spot_normalization = "Total = 1"
 
         # Variables propias de cada eje: velocidad por PWM, motor ON/OFF,
         # limites, escala de conteo y velocidad maxima.
@@ -1238,6 +2834,14 @@ class DigitalTwinApp:
         # Saneamiento de parametros para evitar valores negativos o imposibles.
         self.state.cdr = max(0.0, float(self.state.cdr))
         self.state.delay_s = max(0.01, float(self.state.delay_s))
+        scale_text = str(self.vars["time_scale_choice"].get()).strip().lower()
+        if scale_text.endswith("x"):
+            scale_text = scale_text[:-1].strip()
+        self.state.solar_time_scale = max(0.0, min(float(scale_text), 3600.0))
+        self.state.simulation_step_s = max(0.0, min(float(self.state.simulation_step_s), 86400.0))
+        self.state.set_history_limit(int(self.state.history_limit))
+        self.state.target_scale_m = max(0.001, float(self.state.target_scale_m))
+        self.state.target_tolerance_m = max(0.0, float(self.state.target_tolerance_m))
         self.state.mirror_size_m = max(0.05, float(self.state.mirror_size_m))
         self.state.base_width_m = max(0.05, float(self.state.base_width_m))
         self.state.fork_height_m = max(0.05, float(self.state.fork_height_m))
@@ -1250,6 +2854,14 @@ class DigitalTwinApp:
         s = self.state
         return {
             "timestamp": (_dt.datetime.now() if s.use_live_time else s.simulated_time).isoformat(timespec="seconds"),
+            "initial_simulated_time": (
+                s.initial_simulated_time.isoformat(timespec="seconds")
+                if s.initial_simulated_time is not None
+                else ""
+            ),
+            "simulation_clock_running": s.advance_solar_time,
+            "simulation_time_scale": s.solar_time_scale,
+            "simulation_step_s": s.simulation_step_s,
             "iteration": s.iterations,
             "mode": self.current_mode,
             "state": self.last_status_label,
@@ -1261,9 +2873,84 @@ class DigitalTwinApp:
             "el_error_deg": s.el.target_deg - s.el.angle_deg,
             "spot_x_mm": s.spot_error_x * 1000.0,
             "spot_z_mm": s.spot_error_z * 1000.0,
+            "spot_u_mm": s.spot_error_u * 1000.0,
+            "spot_v_mm": s.spot_error_v * 1000.0,
+            "spot_radial_mm": s.spot_error_radial * 1000.0,
+            "spot_angular_error_deg": s.spot_error_angular_deg,
+            "spot_status": s.spot_status,
+            "spot_valid": s.spot_valid,
+            "tracking": s.tracking,
+            "elapsed_since_correction_s": s.seconds_since_last_correction,
+            "correction_count": s.correction_count,
+            "tracking_updates_manual": s.tracking_updates_manual,
+            "tracking_update_interval_s": s.tracking_update_interval_s,
+            "elapsed_since_tracking_update_s": s.seconds_since_tracking_update,
+            "tracking_update_count": s.tracking_update_count,
+            "tracking_corrected": s.tracking_corrected_this_step,
+            "tracking_error_max_mm": s.tracking_error_max_m * 1000.0,
+            "tracking_error_average_mm": s.tracking_error_average_m * 1000.0,
+            "tracking_error_rms_mm": s.tracking_error_rms_m * 1000.0,
+            "error_mode": s.error_mode,
+            "active_errors": ", ".join(s.error_config.active_error_names()),
+            "ideal_spot_u_mm": s.ideal_spot_u * 1000.0,
+            "ideal_spot_v_mm": s.ideal_spot_v * 1000.0,
+            "ideal_spot_radial_mm": s.ideal_spot_radial * 1000.0,
+            "error_spot_u_mm": s.error_spot_u * 1000.0,
+            "error_spot_v_mm": s.error_spot_v * 1000.0,
+            "error_spot_radial_mm": s.error_spot_radial * 1000.0,
+            "corrected_spot_u_mm": s.corrected_spot_u * 1000.0,
+            "corrected_spot_v_mm": s.corrected_spot_v * 1000.0,
+            "corrected_spot_radial_mm": s.corrected_spot_radial * 1000.0,
+            "drift_correction_enabled": s.correction_config.enabled,
+            "drift_correction_strategy": s.correction_config.strategy,
+            "drift_correction_az_deg": s.drift_correction_az_deg,
+            "drift_correction_el_deg": s.drift_correction_el_deg,
+            "drift_correction_count": s.correction_model.update_count,
+            "drift_corrected": s.drift_corrected_this_step,
+            "facet_field_enabled": s.facet_field_enabled,
+            "facet_view_mode": s.facet_view_mode,
+            "facet_shape": s.facet_shape,
+            "facet_count": s.facet_count,
+            "facet_size_m": s.facet_size_m,
+            "facet_gap_m": s.facet_gap_m,
+            "facet_focal_distance_m": s.facet_focal_distance_m,
+            "facet_selected_id": s.facet_misaligned_id,
+            "facet_active_ids": ",".join(sorted(s.facet_active_ids)),
+            "facet_active_count": len(s.facet_ray_results),
+            "facet_error_max_mm": s.facet_error_max_m * 1000.0,
+            "facet_error_average_mm": s.facet_error_average_m * 1000.0,
+            "facet_compute_ms": s.facet_compute_ms,
+            "spot_map_enabled": s.spot_map_enabled,
+            "spot_base_sigma_m": s.spot_base_sigma_m,
+            "spot_map_half_size_m": s.spot_map_half_size_m,
+            "spot_map_resolution": s.spot_map_resolution,
+            "spot_normalization": s.spot_normalization,
+            "spot_centroid_u_mm": s.spot_metrics.centroid_u_m * 1000.0,
+            "spot_centroid_v_mm": s.spot_metrics.centroid_v_m * 1000.0,
+            "spot_centroid_error_mm": s.spot_metrics.centroid_error_m * 1000.0,
+            "spot_maximum_intensity": s.spot_metrics.maximum_intensity,
+            "spot_total_intensity": s.spot_metrics.total_intensity,
+            "spot_equivalent_diameter_mm": s.spot_metrics.equivalent_diameter_m * 1000.0,
+            "spot_shape": s.spot_metrics.shape,
+            "spot_compute_ms": s.spot_compute_ms,
             "zenith_deg": s.zenith,
             "altitude_deg": s.altitude,
             "solar_azimuth_deg": s.solar_azimuth,
+            "sun_x": s.sun_vector[0],
+            "sun_y": s.sun_vector[1],
+            "sun_z": s.sun_vector[2],
+            "incident_x": s.incident_direction[0],
+            "incident_y": s.incident_direction[1],
+            "incident_z": s.incident_direction[2],
+            "normal_x": s.actual_normal[0],
+            "normal_y": s.actual_normal[1],
+            "normal_z": s.actual_normal[2],
+            "reflected_x": s.reflected_direction[0],
+            "reflected_y": s.reflected_direction[1],
+            "reflected_z": s.reflected_direction[2],
+            "incidence_deg": s.incidence_angle_deg,
+            "reflection_deg": s.reflection_angle_deg,
+            "reflection_target_deg": s.reflection_target_error_deg,
             "rx_m": s.rx,
             "ry_m": s.ry,
             "rz_m": s.rz,
@@ -1289,9 +2976,127 @@ class DigitalTwinApp:
         s.el.target_deg = float(sample["el_target_deg"])
         s.spot_error_x = float(sample["spot_x_mm"]) / 1000.0
         s.spot_error_z = float(sample["spot_z_mm"]) / 1000.0
+        s.spot_error_u = float(sample.get("spot_u_mm", sample["spot_x_mm"])) / 1000.0
+        s.spot_error_v = float(sample.get("spot_v_mm", sample["spot_z_mm"])) / 1000.0
+        s.spot_error_radial = float(
+            sample.get("spot_radial_mm", math.hypot(s.spot_error_u, s.spot_error_v) * 1000.0)
+        ) / 1000.0
+        s.spot_error_angular_deg = float(sample.get("spot_angular_error_deg", 0.0))
+        s.spot_status = str(sample.get("spot_status", classify_target_error(s.spot_error_radial, s.target_tolerance_m)))
+        s.spot_valid = bool(sample.get("spot_valid", True))
+        s.tracking = bool(sample.get("tracking", s.tracking))
+        s.seconds_since_last_correction = float(
+            sample.get("elapsed_since_correction_s", s.seconds_since_last_correction)
+        )
+        s.correction_count = int(sample.get("correction_count", s.correction_count))
+        s.tracking_updates_manual = bool(sample.get("tracking_updates_manual", s.tracking_updates_manual))
+        s.tracking_update_interval_s = float(
+            sample.get("tracking_update_interval_s", s.tracking_update_interval_s)
+        )
+        s.seconds_since_tracking_update = float(
+            sample.get("elapsed_since_tracking_update_s", s.seconds_since_tracking_update)
+        )
+        s.tracking_update_count = int(sample.get("tracking_update_count", s.tracking_update_count))
+        s.tracking_corrected_this_step = bool(sample.get("tracking_corrected", False))
+        s.tracking_error_max_m = float(sample.get("tracking_error_max_mm", 0.0)) / 1000.0
+        s.tracking_error_average_m = float(sample.get("tracking_error_average_mm", 0.0)) / 1000.0
+        s.tracking_error_rms_m = float(sample.get("tracking_error_rms_mm", 0.0)) / 1000.0
+        s.error_mode = str(sample.get("error_mode", s.error_mode))
+        s.ideal_spot_u = float(sample.get("ideal_spot_u_mm", 0.0)) / 1000.0
+        s.ideal_spot_v = float(sample.get("ideal_spot_v_mm", 0.0)) / 1000.0
+        s.ideal_spot_radial = float(sample.get("ideal_spot_radial_mm", 0.0)) / 1000.0
+        s.error_spot_u = float(sample.get("error_spot_u_mm", 0.0)) / 1000.0
+        s.error_spot_v = float(sample.get("error_spot_v_mm", 0.0)) / 1000.0
+        s.error_spot_radial = float(sample.get("error_spot_radial_mm", 0.0)) / 1000.0
+        s.corrected_spot_u = float(sample.get("corrected_spot_u_mm", 0.0)) / 1000.0
+        s.corrected_spot_v = float(sample.get("corrected_spot_v_mm", 0.0)) / 1000.0
+        s.corrected_spot_radial = float(sample.get("corrected_spot_radial_mm", 0.0)) / 1000.0
+        s.correction_config.enabled = bool(
+            sample.get("drift_correction_enabled", s.correction_config.enabled)
+        )
+        s.correction_config.strategy = str(
+            sample.get("drift_correction_strategy", s.correction_config.strategy)
+        )
+        s.drift_correction_az_deg = float(
+            sample.get("drift_correction_az_deg", s.drift_correction_az_deg)
+        )
+        s.drift_correction_el_deg = float(
+            sample.get("drift_correction_el_deg", s.drift_correction_el_deg)
+        )
+        s.correction_model.correction_az_deg = s.drift_correction_az_deg
+        s.correction_model.correction_el_deg = s.drift_correction_el_deg
+        s.correction_model.update_count = int(
+            sample.get("drift_correction_count", s.correction_model.update_count)
+        )
+        s.drift_corrected_this_step = bool(sample.get("drift_corrected", False))
+        s.facet_field_enabled = bool(sample.get("facet_field_enabled", s.facet_field_enabled))
+        s.facet_view_mode = str(sample.get("facet_view_mode", s.facet_view_mode))
+        s.facet_shape = str(sample.get("facet_shape", s.facet_shape))
+        s.facet_count = int(sample.get("facet_count", s.facet_count))
+        s._facet_previous_count = s.facet_count
+        s.facet_size_m = float(sample.get("facet_size_m", s.facet_size_m))
+        s.facet_gap_m = float(sample.get("facet_gap_m", s.facet_gap_m))
+        s.facet_focal_distance_m = float(
+            sample.get("facet_focal_distance_m", s.facet_focal_distance_m)
+        )
+        s.facet_misaligned_id = str(sample.get("facet_selected_id", s.facet_misaligned_id))
+        active_ids_text = str(sample.get("facet_active_ids", ""))
+        if active_ids_text:
+            s.facet_active_ids = {
+                facet_id.strip() for facet_id in active_ids_text.split(",") if facet_id.strip()
+            }
+        s.facet_error_max_m = float(sample.get("facet_error_max_mm", 0.0)) / 1000.0
+        s.facet_error_average_m = float(sample.get("facet_error_average_mm", 0.0)) / 1000.0
+        s.facet_compute_ms = float(sample.get("facet_compute_ms", 0.0))
+        s.spot_map_enabled = bool(sample.get("spot_map_enabled", s.spot_map_enabled))
+        s.spot_base_sigma_m = float(sample.get("spot_base_sigma_m", s.spot_base_sigma_m))
+        s.spot_map_half_size_m = float(
+            sample.get("spot_map_half_size_m", s.spot_map_half_size_m)
+        )
+        s.spot_map_resolution = int(sample.get("spot_map_resolution", s.spot_map_resolution))
+        s.spot_normalization = str(sample.get("spot_normalization", s.spot_normalization))
+        s.spot_metrics = SpotMetrics(
+            centroid_u_m=float(sample.get("spot_centroid_u_mm", 0.0)) / 1000.0,
+            centroid_v_m=float(sample.get("spot_centroid_v_mm", 0.0)) / 1000.0,
+            centroid_error_m=float(sample.get("spot_centroid_error_mm", 0.0)) / 1000.0,
+            maximum_intensity=float(sample.get("spot_maximum_intensity", 0.0)),
+            total_intensity=float(sample.get("spot_total_intensity", 0.0)),
+            equivalent_diameter_m=float(sample.get("spot_equivalent_diameter_mm", 0.0)) / 1000.0,
+            equivalent_radius_m=float(sample.get("spot_equivalent_diameter_mm", 0.0)) / 2000.0,
+            shape=str(sample.get("spot_shape", "Sin spot")),
+        )
+        s.spot_compute_ms = float(sample.get("spot_compute_ms", 0.0))
+        s.advance_solar_time = bool(sample.get("simulation_clock_running", s.advance_solar_time))
+        s.solar_time_scale = float(sample.get("simulation_time_scale", s.solar_time_scale))
+        s.simulation_step_s = float(sample.get("simulation_step_s", s.simulation_step_s))
         s.zenith = float(sample["zenith_deg"])
         s.altitude = float(sample["altitude_deg"])
         s.solar_azimuth = float(sample["solar_azimuth_deg"])
+        s.sun_vector = (
+            float(sample.get("sun_x", s.sun_vector[0])),
+            float(sample.get("sun_y", s.sun_vector[1])),
+            float(sample.get("sun_z", s.sun_vector[2])),
+        )
+        s.incident_direction = (
+            float(sample.get("incident_x", s.incident_direction[0])),
+            float(sample.get("incident_y", s.incident_direction[1])),
+            float(sample.get("incident_z", s.incident_direction[2])),
+        )
+        s.actual_normal = (
+            float(sample.get("normal_x", s.actual_normal[0])),
+            float(sample.get("normal_y", s.actual_normal[1])),
+            float(sample.get("normal_z", s.actual_normal[2])),
+        )
+        s.reflected_direction = (
+            float(sample.get("reflected_x", s.reflected_direction[0])),
+            float(sample.get("reflected_y", s.reflected_direction[1])),
+            float(sample.get("reflected_z", s.reflected_direction[2])),
+        )
+        s.incidence_angle_deg = float(sample.get("incidence_deg", s.incidence_angle_deg))
+        s.reflection_angle_deg = float(sample.get("reflection_deg", s.reflection_angle_deg))
+        s.reflection_target_error_deg = float(
+            sample.get("reflection_target_deg", s.reflection_target_error_deg)
+        )
         s.az.counts = int(round(s.az.angle_deg * s.az.counts_per_degree))
         s.el.counts = int(round(s.el.angle_deg * s.el.counts_per_degree))
 
@@ -1351,6 +3156,42 @@ class DigitalTwinApp:
             gauge.redraw()
         for switch in self.switches:
             switch.redraw()
+        config = self.state.correction_config
+        tolerance_status = (
+            "EN TOLERANCIA"
+            if math.isfinite(self.state.corrected_spot_radial)
+            and self.state.corrected_spot_radial <= self.state.target_tolerance_m
+            else "FUERA DE TOLERANCIA"
+        )
+        status = (
+            f"{config.strategy} | AZ {self.state.drift_correction_az_deg:+.4f} deg | "
+            f"EL {self.state.drift_correction_el_deg:+.4f} deg | "
+            f"actualizaciones {self.state.correction_model.update_count} | {tolerance_status}"
+        )
+        self.correction_status_label.configure(text=status)
+        if self.state.facet_field_enabled:
+            facet_status = (
+                f"{self.state.facet_shape} | activas {len(self.state.facet_ray_results)}/{self.state.facet_count} | "
+                f"error max {self.state.facet_error_max_m * 1000.0:.3f} mm | "
+                f"prom {self.state.facet_error_average_m * 1000.0:.3f} mm | "
+                f"calculo {self.state.facet_compute_ms:.3f} ms"
+            )
+        else:
+            facet_status = "Modelo de facetas desactivado"
+        self.facet_status_label.configure(text=facet_status)
+        if self.state.spot_map_enabled and self.state.spot_map_result is not None:
+            metrics = self.state.spot_metrics
+            spot_status = (
+                f"Centroide {metrics.centroid_u_m * 1000.0:+.2f} / "
+                f"{metrics.centroid_v_m * 1000.0:+.2f} mm | "
+                f"diametro eq. {metrics.equivalent_diameter_m * 1000.0:.2f} mm | "
+                f"{metrics.shape} | {self.state.spot_compute_ms:.2f} ms"
+            )
+        elif self.state.spot_map_enabled:
+            spot_status = "Activa el concentrador y al menos una faceta"
+        else:
+            spot_status = "Mapa de intensidad desactivado"
+        self.spot_status_label.configure(text=spot_status)
         self.update_mode_visuals()
 
     def update_mode_visuals(self) -> None:
@@ -1384,10 +3225,16 @@ class DigitalTwinApp:
             self.apply_controls()
             if self.jog_command and not self.state.automatic:
                 axis, direction = self.jog_command
+                previous_az = self.state.az.angle_deg
+                previous_el = self.state.el.angle_deg
                 if axis == "az":
                     self.state.az.jog(direction, dt)
                 else:
                     self.state.el.jog(direction, dt)
+                self.state.resample_motion_errors(
+                    wrap_deg(self.state.az.angle_deg - previous_az),
+                    self.state.el.angle_deg - previous_el,
+                )
             target_override = (0.0, 90.0) if self.current_mode == "home" else None
             self.state.update(dt, target_override=target_override)
         self.update_readouts()
@@ -1395,6 +3242,11 @@ class DigitalTwinApp:
         self.draw_scene()
         self.draw_receiver_view()
         self.draw_solar_path()
+        self.draw_drift_view()
+        self.draw_error_view()
+        self.draw_correction_view()
+        self.draw_facet_view()
+        self.draw_spot_view()
         self.draw_diagnostic_view()
         self.draw_logic()
         self.draw_event_log()
@@ -1412,6 +3264,30 @@ class DigitalTwinApp:
         self.state_banner.configure(text=f"Estado: {status_label}", bg=status_color)
         self.state_detail.configure(text=status_detail)
         limit_text = "; ".join(self.limit_messages()) if self.limit_messages() else "Dentro de rango"
+        impact_text = (
+            f"{s.spot_error_u * 1000.0:7.1f} / {s.spot_error_v * 1000.0:7.1f}"
+            if s.spot_valid
+            else "SIN IMPACTO"
+        )
+        optical_angles_text = (
+            f"{s.incidence_angle_deg:6.3f} / {s.reflection_angle_deg:6.3f} deg"
+            if math.isfinite(s.incidence_angle_deg) and math.isfinite(s.reflection_angle_deg)
+            else "NO DEFINIDO"
+        )
+        target_difference_text = (
+            f"{s.reflection_target_error_deg:8.4f} deg"
+            if math.isfinite(s.reflection_target_error_deg)
+            else "NO DEFINIDO"
+        )
+        if s.use_live_time:
+            clock_text = f"TIEMPO REAL | {self.active_datetime():%Y-%m-%d %H:%M:%S}"
+        else:
+            clock_state = "EN MARCHA" if s.advance_solar_time else "PAUSADO"
+            clock_text = (
+                f"{clock_state} | {self.active_datetime():%Y-%m-%d %H:%M:%S} | "
+                f"{s.solar_time_scale:g}x"
+            )
+        self.clock_status_label.configure(text=clock_text)
         values = {
             "zenith": f"{s.zenith:8.4f}",
             "altitude": f"{s.altitude:8.4f}",
@@ -1422,10 +3298,31 @@ class DigitalTwinApp:
             "target_acim": f"{s.az.target_deg:8.4f}",
             "el_counts": f"{s.el.counts:d}",
             "az_counts": f"{s.az.counts:d}",
-            "spot": f"{s.spot_error_x * 1000.0:7.1f} / {s.spot_error_z * 1000.0:7.1f}",
+            "spot": impact_text,
             "angular_error": f"{wrap_deg(s.az.target_deg - s.az.angle_deg):6.2f} / {s.el.target_deg - s.el.angle_deg:6.2f}",
+            "optical_angles": optical_angles_text,
+            "reflection_target_error": target_difference_text,
             "limit_status": limit_text,
             "motor_status": f"AZ {'ON' if s.az.motor_on else 'OFF'} | EL {'ON' if s.el.motor_on else 'OFF'}",
+            "correction_elapsed": f"{s.seconds_since_last_correction:8.1f} s solares",
+            "tracking_interval": (
+                f"Manual | {s.seconds_since_tracking_update:7.1f} s"
+                if s.tracking_updates_manual
+                else f"{s.tracking_update_interval_s:g} s | transcurrido {s.seconds_since_tracking_update:7.1f} s"
+            ),
+            "tracking_update_count": f"{s.tracking_update_count:d}",
+            "tracking_error_stats": (
+                f"{s.tracking_error_max_m * 1000.0:6.2f} / "
+                f"{s.tracking_error_average_m * 1000.0:6.2f} / "
+                f"{s.tracking_error_rms_m * 1000.0:6.2f} mm"
+            ),
+            "error_case": f"{s.error_mode} | {len(s.error_config.active_error_names())} activos",
+            "error_comparison": (
+                f"{s.ideal_spot_radial * 1000.0:6.2f} / "
+                f"{s.error_spot_radial * 1000.0:6.2f} / "
+                f"{s.corrected_spot_radial * 1000.0:6.2f} mm"
+            ),
+            "history_status": f"{len(s.history):d} / {s.history_limit:d} muestras",
             "iterations": f"{s.iterations:d}",
         }
         for key, text in values.items():
@@ -1609,7 +3506,10 @@ class DigitalTwinApp:
         for k in (-0.05, 0.05):
             self.line3d(c, v_add(center, v_mul(u, k)), v_add(v_add(center, v_mul(u, k)), v_mul(v, 0.12)), "#b8c9d1", 1)
             self.line3d(c, v_add(center, v_mul(v, k)), v_add(v_add(center, v_mul(v, k)), v_mul(u, 0.12)), "#b8c9d1", 1)
-        self.line3d(c, center, v_add(center, v_mul(n, 0.18)), "#f8d447", 3)
+        if self.state.show_normal_vector:
+            normal_end = v_add(center, v_mul(n, 0.18))
+            self.line3d(c, center, normal_end, "#f8d447", 3)
+            self.text3d(c, v_add(normal_end, (0.0, 0.0, 0.025)), "Normal N", "#f8d447")
         if self.state.az.ina or self.state.az.inb:
             direction = "AZ +" if self.state.az.ina else "AZ -"
             c.create_text(24, 78, anchor="w", text=f"Movimiento {direction}", fill="#ffdf6e", font=("Segoe UI", 11, "bold"))
@@ -1624,10 +3524,8 @@ class DigitalTwinApp:
         rail_end = max(self.state.rail_length_m, target[1] + 0.08)
         self.line3d(c, (0, 0, -0.015), (0, rail_end, -0.015), "#d7d7d7", 4)
         t_unit = v_unit(target)
-        sx = v_unit(v_cross((0, 0, 1), t_unit))
-        if v_norm(sx) < 1e-9:
-            sx = (1, 0, 0)
-        sz = v_unit(v_cross(t_unit, sx))
+        sx = self.state.target_u_axis
+        sz = self.state.target_v_axis
         ring_radius = clamp(self.state.receiver_screen_m, 0.06, 0.24)
         table_z = -0.015
         table_y = target[1]
@@ -1661,22 +3559,39 @@ class DigitalTwinApp:
             top = v_add(target_center, v_mul(sx, leg * 0.7))
             self.line3d(c, base, top, "#8a8a8a", 3)
 
-        # Rayos: el punteado viene desde el Sol hacia el espejo; el solido va
-        # desde el espejo hacia el concentrador. El cono muestra tolerancia cdr.
+        # Vectores opticos con controles independientes para evitar saturacion.
         sun_start = v_add(center, v_mul(self.state.sun_vector, 0.35))
-        self.line3d(c, sun_start, center, "#ffbf4d", 3, dash=(5, 3))
-        self.line3d(c, center, target_center, "#ffef6a", 3)
-        self.text3d(c, v_add(sun_start, (0.0, 0.0, 0.035)), "Sol", "#ffcf69")
-        self.text3d(c, v_add(v_add(center, v_mul(n, 0.18)), (0.0, 0.0, 0.025)), "Normal", "#f8d447")
+        if self.state.show_sun_vector:
+            self.line3d(c, sun_start, center, "#ff9f43", 3, dash=(5, 3))
+            self.text3d(c, v_add(sun_start, (0.0, 0.0, 0.035)), "Incidente -S", "#ffb765")
+
+        reflected_end = target_center
+        if self.state.spot_valid:
+            reflected_end = v_add(self.state.spot_point, (0.0, 0.0, 0.12))
+        elif all(math.isfinite(value) for value in self.state.reflected_direction):
+            reflected_end = v_add(center, v_mul(self.state.reflected_direction, 0.35))
+        if self.state.show_reflected_vector:
+            self.line3d(c, center, reflected_end, "#fff06a", 4)
+            self.text3d(c, v_add(reflected_end, (0.0, 0.0, 0.025)), "Reflejado", "#fff49b")
+
+        target_direction_end = v_add(center, v_mul(t_unit, 0.28))
+        if self.state.show_target_direction:
+            self.line3d(c, center, target_direction_end, "#58d6e7", 3)
+            self.text3d(c, v_add(target_direction_end, (0.0, 0.0, 0.025)), "Objetivo T", "#8ce8f2")
+        if self.state.show_target_line:
+            self.line3d(c, center, target_center, "#b9c6d3", 2, dash=(3, 5))
+            self.text3d(c, v_add(target_center, (0.0, 0.0, 0.035)), "Linea H-target", "#c8d3df")
+
         target_distance = max(0.05, v_norm(self.state.target_vector))
         cone_radius = clamp(target_distance * math.tan(max(0.0, self.state.cdr) * DEG) * self.state.uncertainty_gain, 0.003, 0.08)
-        for edge in (
-            v_add(target_center, v_mul(sx, cone_radius)),
-            v_add(target_center, v_mul(sx, -cone_radius)),
-            v_add(target_center, v_mul(sz, cone_radius)),
-            v_add(target_center, v_mul(sz, -cone_radius)),
-        ):
-            self.line3d(c, center, edge, "#fff4a8", 1, dash=(3, 4))
+        if self.state.show_target_line:
+            for edge in (
+                v_add(target_center, v_mul(sx, cone_radius)),
+                v_add(target_center, v_mul(sx, -cone_radius)),
+                v_add(target_center, v_mul(sz, cone_radius)),
+                v_add(target_center, v_mul(sz, -cone_radius)),
+            ):
+                self.line3d(c, center, edge, "#dce5ed", 1, dash=(3, 4))
         if all(math.isfinite(p) for p in self.state.spot_point):
             spot = v_add(self.state.spot_point, (0.0, 0.0, 0.12))
             px, py, _ = self.project(spot, w, h)
@@ -1685,11 +3600,17 @@ class DigitalTwinApp:
         status_label, status_color, status_detail = self.system_status()
         sun_side = "Oeste" if self.state.sun_vector[0] > 0.02 else "Este" if self.state.sun_vector[0] < -0.02 else "Centro"
         normal_side = "Oeste" if self.state.ideal_normal[0] > 0.02 else "Este" if self.state.ideal_normal[0] < -0.02 else "Centro"
+        spot_info = (
+            f"Impacto U/V {self.state.spot_error_u * 1000.0:+7.1f}, {self.state.spot_error_v * 1000.0:+7.1f} mm"
+            if self.state.spot_valid
+            else "Impacto: sin interseccion frontal"
+        )
         info = (
             f"Acim actual {self.state.az.angle_deg:6.2f} deg  -> {self.state.az.target_deg:6.2f} deg\n"
             f"Elev actual {self.state.el.angle_deg:6.2f} deg  -> {self.state.el.target_deg:6.2f} deg\n"
-            f"Spot error {self.state.spot_error_x * 1000.0:7.1f} mm, {self.state.spot_error_z * 1000.0:7.1f} mm\n"
+            f"{spot_info}\n"
             f"Sol: {sun_side} | Normal ideal: {normal_side}\n"
+            f"i/r {self.state.incidence_angle_deg:6.3f}/{self.state.reflection_angle_deg:6.3f} deg | R-T {self.state.reflection_target_error_deg:6.3f} deg\n"
             f"Vista: {self.vars['view_mode'].get()} | Concentrador: 18 facetas"
         )
         c.create_rectangle(w - 390, 18, w - 18, 172, fill="#172432", outline="#4f6f8d")
@@ -1730,54 +3651,127 @@ class DigitalTwinApp:
         c.create_text(right - 5, bottom - 13, anchor="ne", text=f"{ymin:.1f}", fill="#555555", font=("Consolas", 8))
 
     def draw_receiver_view(self) -> None:
-        """Dibuja la pantalla del concentrador y la posicion del spot.
+        """Dibuja el target virtual y el impacto calculado del rayo reflejado.
 
-        Verde = objetivo ideal en el centro de la pantalla.
-        Rojo = punto donde el modelo calcula que cae el rayo reflejado.
-        La linea roja muestra el historial reciente del spot.
+        El eje ``u`` es horizontal y positivo hacia el oeste; ``v`` es vertical
+        y positivo hacia el cenit. La escala y la tolerancia se leen de
+        ``TwinState`` en metros. Si el impacto cae fuera de escala, el marcador
+        se fija al borde en su direccion real y se rotula como fuera de vista.
         """
         c = self.receiver_canvas
         c.delete("all")
         w, h = max(1, c.winfo_width()), max(1, c.winfo_height())
         c.create_rectangle(0, 0, w, h, fill="#f4f4f4", outline="")
         hist = list(self.state.history)
-        c.create_text(24, 22, anchor="w", text="Pantalla del concentrador: posicion del spot", fill="#111111", font=("Segoe UI", 15, "bold"))
-        cx, cy = w * 0.43, h * 0.52
-        radius = min(w, h) * 0.34
-        c.create_oval(cx - radius, cy - radius, cx + radius, cy + radius, fill="#e9dec0", outline="#7a6b44", width=3)
-        c.create_line(cx - radius, cy, cx + radius, cy, fill="#a09068", width=1)
-        c.create_line(cx, cy - radius, cx, cy + radius, fill="#a09068", width=1)
-        for r in (0.25, 0.5, 0.75):
-            rr = radius * r
-            c.create_oval(cx - rr, cy - rr, cx + rr, cy + rr, outline="#c2b28a")
-        for i in range(18):
-            a = TAU * i / 18.0
-            c.create_line(cx, cy, cx + math.cos(a) * radius, cy + math.sin(a) * radius, fill="#d0bf96")
-        scale = radius / 160.0
+        c.create_text(24, 22, anchor="w", text="Target virtual: interseccion rayo-plano", fill="#111111", font=("Segoe UI", 15, "bold"))
+        cx, cy = w * 0.37, h * 0.52
+        half_pixels = max(40.0, min(w * 0.31, h * 0.40))
+        half_range_m = max(0.001, self.state.target_scale_m)
+        pixels_per_m = half_pixels / half_range_m
+        left, right = cx - half_pixels, cx + half_pixels
+        top, bottom = cy - half_pixels, cy + half_pixels
+        c.create_rectangle(left, top, right, bottom, fill="#fbf8ed", outline="#6f6040", width=3)
+
+        # Reticula uniforme; las etiquetas expresan milimetros locales.
+        divisions = 4
+        for i in range(-divisions, divisions + 1):
+            offset = half_pixels * i / divisions
+            color = "#8a7b58" if i == 0 else "#d6c9a8"
+            width_line = 2 if i == 0 else 1
+            c.create_line(cx + offset, top, cx + offset, bottom, fill=color, width=width_line)
+            c.create_line(left, cy - offset, right, cy - offset, fill=color, width=width_line)
+            value_mm = half_range_m * 1000.0 * i / divisions
+            if i != 0:
+                c.create_text(cx + offset, bottom + 13, text=f"{value_mm:.0f}", fill="#5d5138", font=("Consolas", 8))
+                c.create_text(left - 8, cy - offset, anchor="e", text=f"{value_mm:.0f}", fill="#5d5138", font=("Consolas", 8))
+        c.create_text(right, bottom + 30, anchor="e", text="u [mm]  oeste +", fill="#333333", font=("Segoe UI", 9, "bold"))
+        c.create_text(left, top - 16, anchor="w", text="v [mm]  cenit +", fill="#333333", font=("Segoe UI", 9, "bold"))
+
+        screen_radius_px = min(half_pixels, 0.5 * self.state.receiver_screen_m * pixels_per_m)
+        c.create_oval(
+            cx - screen_radius_px,
+            cy - screen_radius_px,
+            cx + screen_radius_px,
+            cy + screen_radius_px,
+            outline="#9b7a2f",
+            width=2,
+        )
+        tolerance_px = min(half_pixels, self.state.target_tolerance_m * pixels_per_m)
+        c.create_oval(
+            cx - tolerance_px,
+            cy - tolerance_px,
+            cx + tolerance_px,
+            cy + tolerance_px,
+            outline="#159447",
+            width=3,
+            dash=(5, 3),
+        )
+
         pts = []
         for p in hist[-220:]:
-            x = cx + p["err_x"] * 1000.0 * scale
-            y = cy - p["err_z"] * 1000.0 * scale
-            if cx - radius <= x <= cx + radius and cy - radius <= y <= cy + radius:
+            if not p.get("spot_valid", True):
+                continue
+            u_m = float(p.get("err_u", p["err_x"]))
+            v_m = float(p.get("err_v", p["err_z"]))
+            x = cx + u_m * pixels_per_m
+            y = cy - v_m * pixels_per_m
+            if left <= x <= right and top <= y <= bottom:
                 pts.extend([x, y])
         if len(pts) >= 4:
             c.create_line(*pts, fill="#cc3333", width=2)
-        sx = cx + self.state.spot_error_x * 1000.0 * scale
-        sz = cy - self.state.spot_error_z * 1000.0 * scale
         c.create_oval(cx - 6, cy - 6, cx + 6, cy + 6, fill="#2fbf62", outline="#ffffff", width=2)
-        c.create_oval(sx - 8, sz - 8, sx + 8, sz + 8, fill="#ff3030", outline="#ffffff", width=2)
-        tol = max(5.0, self.state.cdr * 35.0) * scale
-        c.create_oval(cx - tol, cy - tol, cx + tol, cy + tol, outline="#31a354", width=2, dash=(5, 3))
-        error_mag = math.hypot(self.state.spot_error_x, self.state.spot_error_z) * 1000.0
-        text_x = w * 0.74
+
+        outside_view = False
+        if self.state.spot_valid:
+            raw_x = cx + self.state.spot_error_u * pixels_per_m
+            raw_y = cy - self.state.spot_error_v * pixels_per_m
+            outside_view = not (left <= raw_x <= right and top <= raw_y <= bottom)
+            marker_x = clamp(raw_x, left, right)
+            marker_y = clamp(raw_y, top, bottom)
+            marker_color = {
+                "centrado": "#16883f",
+                "aceptable": "#e09a16",
+                "fuera de tolerancia": "#d92828",
+            }.get(self.state.spot_status, "#d92828")
+            c.create_oval(marker_x - 8, marker_y - 8, marker_x + 8, marker_y + 8, fill=marker_color, outline="#ffffff", width=2)
+            if outside_view:
+                c.create_text(marker_x, marker_y - 16, text="fuera de escala", fill="#9f1239", font=("Segoe UI", 9, "bold"))
+
+        text_x = w * 0.72
         c.create_rectangle(text_x - 18, 92, w - 28, h - 72, fill="#ffffff", outline="#c7c7c7")
         c.create_text(text_x, 118, anchor="w", text="Lectura directa", fill="#111111", font=("Segoe UI", 13, "bold"))
-        c.create_text(text_x, 160, anchor="w", text=f"Error X: {self.state.spot_error_x * 1000.0:8.1f} mm", fill="#a41d1d", font=("Consolas", 13))
-        c.create_text(text_x, 190, anchor="w", text=f"Error Z: {self.state.spot_error_z * 1000.0:8.1f} mm", fill="#1d6f42", font=("Consolas", 13))
-        c.create_text(text_x, 220, anchor="w", text=f"Error total: {error_mag:7.1f} mm", fill="#111111", font=("Consolas", 13, "bold"))
-        c.create_text(text_x, 250, anchor="w", text=f"cdr: +/- {self.state.cdr:.3f} deg", fill="#111111", font=("Consolas", 12))
-        c.create_text(text_x, 285, anchor="w", text="Verde = objetivo\nRojo = spot simulado\nLinea roja = historial reciente", fill="#333333", font=("Segoe UI", 10))
-        c.create_text(text_x, 365, anchor="w", text="Esta vista responde a la pregunta:\n?donde esta cayendo el rayo?", fill="#555555", font=("Segoe UI", 11))
+        if self.state.spot_valid:
+            readout_lines = (
+                f"Horizontal u: {self.state.spot_error_u * 1000.0:+8.2f} mm\n"
+                f"Vertical v:   {self.state.spot_error_v * 1000.0:+8.2f} mm\n"
+                f"Error radial: {self.state.spot_error_radial * 1000.0:8.2f} mm\n"
+                f"Error angular:{self.state.spot_error_angular_deg:8.4f} deg\n"
+                f"Distancia rayo:{self.state.spot_ray_t:7.3f} m"
+            )
+        else:
+            readout_lines = "El rayo es paralelo al plano\no intersecta el target al frente."
+        c.create_text(text_x, 154, anchor="nw", text=readout_lines, fill="#222222", font=("Consolas", 11))
+        status_color = {
+            "centrado": "#16883f",
+            "aceptable": "#b7791f",
+            "fuera de tolerancia": "#b91c1c",
+            "sin impacto": "#6b7280",
+        }.get(self.state.spot_status, "#6b7280")
+        c.create_rectangle(text_x, 294, w - 46, 328, fill=status_color, outline="")
+        c.create_text(text_x + 10, 311, anchor="w", text=self.state.spot_status.upper(), fill="#ffffff", font=("Segoe UI", 11, "bold"))
+        c.create_text(
+            text_x,
+            350,
+            anchor="nw",
+            text=(
+                f"Escala: +/- {half_range_m * 1000.0:.0f} mm\n"
+                f"Tolerancia: {self.state.target_tolerance_m * 1000.0:.1f} mm\n"
+                f"Pantalla: {self.state.receiver_screen_m * 1000.0:.0f} mm diam.\n"
+                "Centro verde | trayectoria roja"
+            ),
+            fill="#333333",
+            font=("Segoe UI", 10),
+        )
 
     def active_datetime(self) -> _dt.datetime:
         """Devuelve la fecha/hora que esta usando el gemelo en este instante."""
@@ -1840,6 +3834,779 @@ class DigitalTwinApp:
             c.create_rectangle(w - 330, 235, w - 42, 286, fill="#fff1f2", outline="#fecdd3")
             c.create_text(w - 314, 260, anchor="w", text="Sol bajo horizonte", fill="#9f1239", font=("Segoe UI", 11, "bold"))
 
+    def draw_drift_view(self) -> None:
+        """Grafica la deriva del spot y el tiempo desde la ultima correccion."""
+        c = self.drift_canvas
+        c.delete("all")
+        w, h = max(1, c.winfo_width()), max(1, c.winfo_height())
+        c.create_rectangle(0, 0, w, h, fill="#f4f4f4", outline="")
+        hist = list(self.state.history)
+        tracking_text = "ACTIVO" if self.state.tracking else "DETENIDO / POSE FIJA"
+        tracking_color = "#16883f" if self.state.tracking else "#b91c1c"
+        c.create_text(24, 22, anchor="w", text="Deriva temporal del punto reflejado", fill="#111111", font=("Segoe UI", 15, "bold"))
+        c.create_rectangle(24, 46, w - 24, 80, fill="#ffffff", outline="#c7c7c7")
+        c.create_rectangle(24, 46, 245, 80, fill=tracking_color, outline="")
+        c.create_text(38, 63, anchor="w", text=f"SEGUIMIENTO: {tracking_text}", fill="#ffffff", font=("Segoe UI", 10, "bold"))
+        c.create_text(
+            265,
+            63,
+            anchor="w",
+            text=(
+                f"Hora solar {self.active_datetime():%Y-%m-%d %H:%M:%S}   |   "
+                f"intervalo {'Manual' if self.state.tracking_updates_manual else f'{self.state.tracking_update_interval_s:g} s'}   |   "
+                f"desde actualizacion {self.state.seconds_since_tracking_update:.1f} s   |   "
+                f"correcciones {self.state.tracking_update_count}"
+            ),
+            fill="#222222",
+            font=("Consolas", 10),
+        )
+
+        gap = 18
+        left = 24
+        right = w - 24
+        top = 96
+        bottom = h - 28
+        mid_x = (left + right) // 2
+        mid_y = (top + bottom) // 2
+        boxes = (
+            (left, top, mid_x - gap // 2, mid_y - gap // 2),
+            (mid_x + gap // 2, top, right, mid_y - gap // 2),
+            (left, mid_y + gap // 2, mid_x - gap // 2, bottom),
+            (mid_x + gap // 2, mid_y + gap // 2, right, bottom),
+        )
+        titles = (
+            "Error horizontal u vs tiempo",
+            "Error vertical v vs tiempo",
+            "Error radial vs tiempo",
+            "Tiempo desde ultima actualizacion",
+        )
+        labels = ("mm", "mm", "mm", "s solares")
+        colors = ("#2563eb", "#805ad5", "#c53030", "#16883f")
+        keys = ("err_u", "err_v", "err_radial", "elapsed_since_tracking_update_s")
+        series: list[list[float]] = []
+        for key in keys:
+            values: list[float] = []
+            for sample in hist:
+                if key != "elapsed_since_tracking_update_s" and not sample.get("spot_valid", True):
+                    continue
+                value = float(sample.get(key, 0.0))
+                if math.isfinite(value):
+                    values.append(value if key == "elapsed_since_tracking_update_s" else value * 1000.0)
+            series.append(values)
+
+        for box, title, label, color, values in zip(boxes, titles, labels, colors, series):
+            self.draw_axes(c, *box, title, label)
+            if title == "Error radial vs tiempo":
+                upper = max(values + [1.0])
+                self.plot_series(c, box, values, color, 0.0, upper)
+            elif title == "Tiempo desde ultima actualizacion":
+                upper = max(values + [1.0])
+                self.plot_series(c, box, values, color, 0.0, upper)
+            else:
+                extent = max([abs(value) for value in values] + [1.0])
+                self.plot_series(c, box, values, color, -extent, extent)
+
+        # Marcas verticales doradas: instantes en que la pose fue corregida.
+        if len(hist) >= 2:
+            radial_box = boxes[2]
+            plot_left = radial_box[0] + 45
+            plot_right = radial_box[2] - 16
+            plot_top = radial_box[1] + 18
+            plot_bottom = radial_box[3] - 30
+            for idx, sample in enumerate(hist):
+                if sample.get("tracking_corrected", False):
+                    marker_x = plot_left + (plot_right - plot_left) * idx / (len(hist) - 1)
+                    c.create_line(marker_x, plot_top, marker_x, plot_bottom, fill="#d69e2e", width=1, dash=(3, 3))
+            c.create_text(
+                radial_box[2] - 24,
+                radial_box[1] + 28,
+                anchor="ne",
+                text="dorado = correccion",
+                fill="#9a6700",
+                font=("Segoe UI", 8, "bold"),
+            )
+
+        if not hist:
+            c.create_text(w / 2, h / 2, text="Sin muestras: inicia la simulacion para formar la trayectoria", fill="#6b7280", font=("Segoe UI", 13, "bold"))
+        else:
+            first_time = str(hist[0].get("solar_time", ""))[11:19]
+            last_time = str(hist[-1].get("solar_time", ""))[11:19]
+            for box in boxes:
+                c.create_text(box[0] + 48, box[3] - 13, anchor="w", text=first_time, fill="#666666", font=("Consolas", 8))
+                c.create_text(box[2] - 18, box[3] - 13, anchor="e", text=last_time, fill="#666666", font=("Consolas", 8))
+
+    def draw_error_view(self) -> None:
+        """Compara los impactos ideal, perturbado y compensado."""
+        c = self.error_canvas
+        c.delete("all")
+        w, h = max(1, c.winfo_width()), max(1, c.winfo_height())
+        c.create_rectangle(0, 0, w, h, fill="#f4f4f4", outline="")
+        s = self.state
+        c.create_text(24, 22, anchor="w", text="Comparacion de errores geometricos y mecanicos", fill="#111111", font=("Segoe UI", 15, "bold"))
+        mode_color = {"Ideal": "#16883f", "Con error": "#b91c1c", "Corregido": "#2563eb"}.get(s.error_mode, "#475569")
+        c.create_rectangle(24, 48, 270, 82, fill=mode_color, outline="")
+        c.create_text(38, 65, anchor="w", text=f"CASO MOSTRADO: {s.error_mode.upper()}", fill="#ffffff", font=("Segoe UI", 10, "bold"))
+        active_names = s.error_config.active_error_names()
+        c.create_text(
+            292,
+            65,
+            anchor="w",
+            text="Activos: " + (", ".join(active_names) if active_names else "ninguno"),
+            fill="#222222",
+            font=("Segoe UI", 10),
+        )
+
+        cx, cy = w * 0.34, h * 0.52
+        half_pixels = max(80.0, min(w * 0.27, h * 0.35))
+        half_range_m = max(0.001, s.target_scale_m)
+        pixels_per_m = half_pixels / half_range_m
+        left, right = cx - half_pixels, cx + half_pixels
+        top, bottom = cy - half_pixels, cy + half_pixels
+        c.create_rectangle(left, top, right, bottom, fill="#fffdf5", outline="#6f6040", width=3)
+        for idx in range(-4, 5):
+            offset = half_pixels * idx / 4.0
+            color = "#8a7b58" if idx == 0 else "#ded5bc"
+            c.create_line(cx + offset, top, cx + offset, bottom, fill=color)
+            c.create_line(left, cy - offset, right, cy - offset, fill=color)
+        tolerance_px = min(half_pixels, s.target_tolerance_m * pixels_per_m)
+        c.create_oval(cx - tolerance_px, cy - tolerance_px, cx + tolerance_px, cy + tolerance_px, outline="#16883f", width=2, dash=(5, 3))
+        c.create_text(cx, bottom + 30, text="u [mm] oeste +", fill="#333333", font=("Segoe UI", 9, "bold"))
+        c.create_text(left, top - 18, anchor="w", text="v [mm] cenit +", fill="#333333", font=("Segoe UI", 9, "bold"))
+
+        cases = (
+            ("Ideal", s.ideal_spot_u, s.ideal_spot_v, s.ideal_spot_radial, "#16883f"),
+            ("Con error", s.error_spot_u, s.error_spot_v, s.error_spot_radial, "#d62828"),
+            ("Corregido", s.corrected_spot_u, s.corrected_spot_v, s.corrected_spot_radial, "#2563eb"),
+        )
+        for label, u_m, v_m, _radial_m, color in cases:
+            if not (math.isfinite(u_m) and math.isfinite(v_m)):
+                continue
+            px = clamp(cx + u_m * pixels_per_m, left, right)
+            py = clamp(cy - v_m * pixels_per_m, top, bottom)
+            radius = 9 if label == s.error_mode else 6
+            c.create_oval(px - radius, py - radius, px + radius, py + radius, fill=color, outline="#ffffff", width=2)
+            c.create_text(px + 10, py - 10, anchor="w", text=label, fill=color, font=("Segoe UI", 8, "bold"))
+
+        panel_x = w * 0.68
+        panel_left = panel_x - 80
+        c.create_rectangle(panel_left, 112, w - 28, h - 42, fill="#ffffff", outline="#c7c7c7")
+        c.create_text(panel_x, 136, anchor="w", text="Errores sobre el target", fill="#111111", font=("Segoe UI", 13, "bold"))
+        y = 176
+        max_radial_mm = max(
+            [value * 1000.0 for _label, _u, _v, value, _color in cases if math.isfinite(value)] + [1.0]
+        )
+        for label, u_m, v_m, radial_m, color in cases:
+            c.create_text(panel_x, y, anchor="w", text=label, fill=color, font=("Segoe UI", 11, "bold"))
+            if math.isfinite(radial_m):
+                values_text = f"u {u_m * 1000.0:+8.2f} | v {v_m * 1000.0:+8.2f} | r {radial_m * 1000.0:8.2f} mm"
+                c.create_text(panel_x, y + 24, anchor="w", text=values_text, fill="#222222", font=("Consolas", 10))
+                c.create_rectangle(panel_x, y + 46, w - 62, y + 62, fill="#ececec", outline="#cccccc")
+                bar_end = panel_x + (w - 62 - panel_x) * radial_m * 1000.0 / max_radial_mm
+                c.create_rectangle(panel_x, y + 46, bar_end, y + 62, fill=color, outline="")
+            else:
+                c.create_text(panel_x, y + 24, anchor="w", text="sin impacto", fill="#6b7280", font=("Consolas", 10))
+            y += 100
+
+        sample = s.motion_error_sample
+        sample_text = (
+            "Muestra dependiente del movimiento\n"
+            f"Direccion AZ/EL: {sample.az_direction:+d} / {sample.el_direction:+d}\n"
+            f"Backlash AZ/EL: {sample.backlash_az_deg:+.4f} / {sample.backlash_el_deg:+.4f} deg\n"
+            f"Error subida/bajada: {sample.directional_el_deg:+.4f} deg\n"
+            f"Ruido AZ/EL: {sample.noise_az_deg:+.4f} / {sample.noise_el_deg:+.4f} deg\n"
+            f"Compensacion manual AZ/EL: {s.error_config.correction_azimuth_deg:+.4f} / {s.error_config.correction_elevation_deg:+.4f} deg\n"
+            f"Correccion deriva AZ/EL: {s.drift_correction_az_deg:+.4f} / {s.drift_correction_el_deg:+.4f} deg"
+        )
+        c.create_text(panel_x, y + 8, anchor="nw", text=sample_text, fill="#222222", font=("Consolas", 10))
+
+    def draw_correction_view(self) -> None:
+        """Compara deriva sin/con correccion y grafica el comando aplicado."""
+        c = self.correction_canvas
+        c.delete("all")
+        w, h = max(1, c.winfo_width()), max(1, c.winfo_height())
+        c.create_rectangle(0, 0, w, h, fill="#f4f4f4", outline="")
+        s = self.state
+        c.create_text(
+            24,
+            22,
+            anchor="w",
+            text="Correccion progresiva de deriva",
+            fill="#111111",
+            font=("Segoe UI", 15, "bold"),
+        )
+        tolerance_status = (
+            "EN TOLERANCIA"
+            if math.isfinite(s.corrected_spot_radial)
+            and s.corrected_spot_radial <= s.target_tolerance_m
+            else "FUERA DE TOLERANCIA"
+        )
+        summary = (
+            f"{s.correction_config.strategy} | AZ {s.drift_correction_az_deg:+.4f} deg | "
+            f"EL {s.drift_correction_el_deg:+.4f} deg | "
+            f"actualizaciones {s.correction_model.update_count} | {tolerance_status}"
+        )
+        c.create_text(24, 52, anchor="w", text=summary, fill="#333333", font=("Consolas", 10))
+        top_box = (24, 82, w - 24, int(h * 0.52))
+        bottom_box = (24, int(h * 0.57), w - 24, h - 34)
+        self.draw_axes(c, *top_box, "Error radial: sin correccion vs corregido", "mm")
+        self.draw_axes(c, *bottom_box, "Compensacion angular aplicada", "deg")
+
+        hist = list(s.history)
+        if not hist:
+            c.create_text(
+                w / 2,
+                h / 2,
+                text="Sin muestras: inicia la simulacion para comparar",
+                fill="#6b7280",
+                font=("Segoe UI", 12, "bold"),
+            )
+            return
+
+        def finite_value(sample: dict[str, object], key: str) -> float:
+            value = float(sample.get(key, 0.0))
+            return value if math.isfinite(value) else 0.0
+
+        without_mm = [finite_value(sample, "error_spot_radial") * 1000.0 for sample in hist]
+        corrected_mm = [finite_value(sample, "corrected_spot_radial") * 1000.0 for sample in hist]
+        correction_az = [finite_value(sample, "drift_correction_az_deg") for sample in hist]
+        correction_el = [finite_value(sample, "drift_correction_el_deg") for sample in hist]
+        radial_max = max(without_mm + corrected_mm + [1.0])
+        angular_extent = max([abs(value) for value in correction_az + correction_el] + [0.1])
+        self.plot_series(c, top_box, without_mm, "#d62828", 0.0, radial_max)
+        self.plot_series(c, top_box, corrected_mm, "#2563eb", 0.0, radial_max)
+        self.plot_series(c, bottom_box, correction_az, "#7c3aed", -angular_extent, angular_extent)
+        self.plot_series(c, bottom_box, correction_el, "#0f766e", -angular_extent, angular_extent)
+        c.create_text(w - 42, 100, anchor="ne", text="rojo: sin correccion   azul: corregido", fill="#333333", font=("Segoe UI", 9, "bold"))
+        c.create_text(w - 42, bottom_box[1] + 18, anchor="ne", text="morado: AZ   verde: EL", fill="#333333", font=("Segoe UI", 9, "bold"))
+
+        if len(hist) >= 2:
+            left = top_box[0] + 45
+            right = top_box[2] - 16
+            top = top_box[1] + 18
+            bottom = top_box[3] - 30
+            for idx, sample in enumerate(hist):
+                if bool(sample.get("drift_corrected", False)):
+                    x = left + (right - left) * idx / (len(hist) - 1)
+                    c.create_line(x, top, x, bottom, fill="#d69e2e", width=1, dash=(3, 3))
+
+    def draw_facet_view(self) -> None:
+        """Dibuja facetas, rayos centrales e impactos sobre el receptor."""
+        c = self.facet_canvas
+        c.delete("all")
+        w, h = max(1, c.winfo_width()), max(1, c.winfo_height())
+        c.create_rectangle(0, 0, w, h, fill="#f4f4f4", outline="")
+        s = self.state
+        c.create_text(
+            24,
+            22,
+            anchor="w",
+            text="Concentrador facetado: un rayo central por faceta",
+            fill="#111111",
+            font=("Segoe UI", 15, "bold"),
+        )
+        summary = (
+            f"{s.facet_shape} | activas {len(s.facet_ray_results)}/{s.facet_count} | foco {s.facet_focal_distance_m:.3f} m | "
+            f"error max {s.facet_error_max_m * 1000.0:.3f} mm | "
+            f"calculo {s.facet_compute_ms:.3f} ms"
+        )
+        c.create_text(24, 52, anchor="w", text=summary, fill="#333333", font=("Consolas", 10))
+        if not s.facet_field_enabled:
+            c.create_text(
+                w / 2,
+                h / 2,
+                text="Activa 'Concentrador facetado' para calcular la distribucion seleccionada",
+                fill="#6b7280",
+                font=("Segoe UI", 13, "bold"),
+            )
+            return
+
+        schematic = (24, 82, int(w * 0.48), int(h * 0.60))
+        receiver = (int(w * 0.52), 82, w - 24, int(h * 0.60))
+        c.create_rectangle(*schematic, fill="#101821", outline="#718096")
+        c.create_rectangle(*receiver, fill="#fffdf5", outline="#8a7b58", width=2)
+        c.create_text(schematic[0] + 12, schematic[1] + 10, anchor="nw", text=f"Esquema: {s.facet_view_mode}", fill="#ffffff", font=("Segoe UI", 11, "bold"))
+        c.create_text(receiver[0] + 12, receiver[1] + 10, anchor="nw", text="Plano receptor / foco", fill="#111111", font=("Segoe UI", 11, "bold"))
+
+        result_by_id = {result.facet_id: result for result in s.facet_ray_results}
+        mirror_normal = s.actual_normal
+        if v_norm(mirror_normal) < 1e-9:
+            mirror_normal = normal_from_angles(s.az.angle_deg, s.el.angle_deg + s.peralte)
+        mirror_normal = v_unit(mirror_normal)
+        mirror_u = v_cross((0.0, 0.0, 1.0), mirror_normal)
+        if v_norm(mirror_u) < 1e-9:
+            mirror_u = (1.0, 0.0, 0.0)
+        mirror_u = v_unit(mirror_u)
+        mirror_v = v_unit(v_cross(mirror_normal, mirror_u))
+        mirror_half = max(0.025, s.mirror_size_m / 2.0)
+
+        def draw_facet_shape(
+            center_x: float,
+            center_y: float,
+            radius_px: float,
+            shape: str,
+            fill: str,
+        ) -> None:
+            radius_px = clamp(radius_px, 3.0, 11.0)
+            if shape == "Circular":
+                c.create_oval(
+                    center_x - radius_px,
+                    center_y - radius_px,
+                    center_x + radius_px,
+                    center_y + radius_px,
+                    fill=fill,
+                    outline="#ffffff",
+                )
+            elif shape == "Hexagonal":
+                points: list[float] = []
+                for vertex in range(6):
+                    angle = math.radians(-90.0 + vertex * 60.0)
+                    points.extend(
+                        [
+                            center_x + radius_px * math.cos(angle),
+                            center_y + radius_px * math.sin(angle),
+                        ]
+                    )
+                c.create_polygon(*points, fill=fill, outline="#ffffff")
+            else:
+                c.create_rectangle(
+                    center_x - radius_px,
+                    center_y - radius_px,
+                    center_x + radius_px,
+                    center_y + radius_px,
+                    fill=fill,
+                    outline="#ffffff",
+                )
+
+        if s.facet_view_mode == "Resumen":
+            helio_x = schematic[0] + 58
+            axis_y = (schematic[1] + schematic[3]) / 2.0
+            concentrator_x = schematic[2] - 58
+            focus_x = concentrator_x - (concentrator_x - helio_x) * 0.36
+            max_layout_extent = max(
+                [
+                    max(abs(facet.layout_u_m), abs(facet.layout_v_m))
+                    for facet in s.facets
+                ]
+                + [s.facet_size_m]
+            )
+            layout_scale = min(900.0, 72.0 / max(1e-6, max_layout_extent))
+            facet_radius = s.facet_size_m * layout_scale * 0.45
+            target_axis = v_unit(s.target_vector)
+            normal_axis_component = v_dot(mirror_normal, target_axis)
+            normal_vertical_component = mirror_normal[2]
+            mirror_direction_x = -normal_vertical_component
+            mirror_direction_y = -normal_axis_component
+            mirror_direction_norm = max(
+                1e-9,
+                math.hypot(mirror_direction_x, mirror_direction_y),
+            )
+            mirror_direction_x /= mirror_direction_norm
+            mirror_direction_y /= mirror_direction_norm
+            mirror_display_half = 62.0
+            mirror_screen_normal_x = -mirror_direction_y
+            mirror_screen_normal_y = mirror_direction_x
+            mirror_polygon = []
+            for along, across in (
+                (-mirror_display_half, -6.0),
+                (mirror_display_half, -6.0),
+                (mirror_display_half, 6.0),
+                (-mirror_display_half, 6.0),
+            ):
+                mirror_polygon.extend(
+                    [
+                        helio_x + mirror_direction_x * along + mirror_screen_normal_x * across,
+                        axis_y + mirror_direction_y * along + mirror_screen_normal_y * across,
+                    ]
+                )
+            c.create_polygon(*mirror_polygon, fill="#b8d8ff", outline="#ffffff", width=2)
+            c.create_line(helio_x, axis_y + 5, helio_x, axis_y + 84, fill="#94a3b8", width=3)
+            c.create_line(helio_x - 15, axis_y + 84, helio_x + 15, axis_y + 84, fill="#94a3b8", width=3)
+            c.create_text(
+                helio_x,
+                axis_y + 101,
+                text=f"Heliostato  AZ {s.az.angle_deg:.1f} / EL {s.el.angle_deg:.1f}",
+                fill="#dbeafe",
+                font=("Segoe UI", 8, "bold"),
+            )
+            for fraction in (-0.72, -0.36, 0.0, 0.36, 0.72):
+                ray_start_x = helio_x + mirror_direction_x * mirror_display_half * fraction
+                ray_start_y = axis_y + mirror_direction_y * mirror_display_half * fraction
+                c.create_line(
+                    ray_start_x,
+                    ray_start_y,
+                    ray_start_x + 56.0,
+                    ray_start_y,
+                    fill="#ffb454",
+                    width=2,
+                    arrow="last",
+                )
+            c.create_line(helio_x, axis_y, concentrator_x, axis_y, fill="#64748b", dash=(4, 4))
+            c.create_line(focus_x, axis_y - 55, focus_x, axis_y + 55, fill="#58d6e7", width=2)
+            c.create_text(focus_x, axis_y - 66, text="Receptor", fill="#8ce8f2", font=("Segoe UI", 9, "bold"))
+            for facet in s.facets:
+                facet_y = axis_y - facet.layout_v_m * layout_scale
+                facet_x = concentrator_x + facet.layout_u_m * layout_scale
+                color = "#d6b95f" if facet.active else "#5f6570"
+                draw_facet_shape(facet_x, facet_y, facet_radius, facet.shape, color)
+                if s.facet_count <= 18 or facet.id == s.facet_misaligned_id:
+                    c.create_text(facet_x + 9, facet_y, anchor="w", text=facet.id, fill="#ffffff", font=("Consolas", 8))
+                if not facet.active:
+                    continue
+                result = result_by_id.get(facet.id)
+                ray_color = "#66d9ef" if result and math.isfinite(result.focus_error_m) else "#ef4444"
+                impact_y = axis_y
+                if result and math.isfinite(result.impact_v_m):
+                    impact_y -= clamp(result.impact_v_m * 1200.0, -55.0, 55.0)
+                c.create_line(facet_x, facet_y, focus_x, impact_y, fill=ray_color, width=1)
+        else:
+            mirror_corners = [
+                v_add(v_mul(mirror_u, sign_u * mirror_half), v_mul(mirror_v, sign_v * mirror_half))
+                for sign_u, sign_v in ((-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0))
+            ]
+            world_points = [s.facet_focus, *mirror_corners]
+            world_points.extend(facet.center for facet in s.facets)
+            world_points.extend(
+                result.impact_point
+                for result in s.facet_ray_results
+                if result.impact_point is not None
+            )
+
+            def raw_projection(point: tuple[float, float, float]) -> tuple[float, float]:
+                x_m, y_m, z_m = point
+                if s.facet_view_mode == "Superior X-Y":
+                    return (y_m, x_m)
+                if s.facet_view_mode == "Lateral Y-Z":
+                    return (y_m, z_m)
+                return (x_m - 0.65 * y_m, z_m - 0.25 * x_m - 0.22 * y_m)
+
+            raw_points = [raw_projection(point) for point in world_points]
+            min_x = min(point[0] for point in raw_points)
+            max_x = max(point[0] for point in raw_points)
+            min_y = min(point[1] for point in raw_points)
+            max_y = max(point[1] for point in raw_points)
+            span_x = max(0.05, max_x - min_x)
+            span_y = max(0.05, max_y - min_y)
+            usable_w = max(10.0, schematic[2] - schematic[0] - 80.0)
+            usable_h = max(10.0, schematic[3] - schematic[1] - 72.0)
+            projection_scale = min(usable_w / span_x, usable_h / span_y)
+            middle_x = (min_x + max_x) / 2.0
+            middle_y = (min_y + max_y) / 2.0
+            screen_cx = (schematic[0] + schematic[2]) / 2.0
+            screen_cy = (schematic[1] + schematic[3]) / 2.0 + 8.0
+
+            def project_facet(point: tuple[float, float, float]) -> tuple[float, float]:
+                projected_x, projected_y = raw_projection(point)
+                return (
+                    screen_cx + (projected_x - middle_x) * projection_scale,
+                    screen_cy - (projected_y - middle_y) * projection_scale,
+                )
+
+            focus_px, focus_py = project_facet(s.facet_focus)
+            mirror_polygon: list[float] = []
+            for corner in mirror_corners:
+                corner_x, corner_y = project_facet(corner)
+                mirror_polygon.extend([corner_x, corner_y])
+            c.create_polygon(*mirror_polygon, fill="#8fc5ff", outline="#ffffff", width=2)
+            mirror_center_x, mirror_center_y = project_facet((0.0, 0.0, 0.0))
+            c.create_line(
+                mirror_center_x,
+                mirror_center_y + 5,
+                mirror_center_x,
+                mirror_center_y + 28,
+                fill="#94a3b8",
+                width=3,
+            )
+            c.create_line(
+                mirror_center_x - 16,
+                mirror_center_y + 28,
+                mirror_center_x + 16,
+                mirror_center_y + 28,
+                fill="#94a3b8",
+                width=3,
+            )
+            normal_tip_x, normal_tip_y = project_facet(v_mul(mirror_normal, mirror_half * 0.8))
+            c.create_line(
+                mirror_center_x,
+                mirror_center_y,
+                normal_tip_x,
+                normal_tip_y,
+                fill="#f472b6",
+                width=2,
+                arrow="last",
+            )
+            c.create_text(
+                mirror_center_x,
+                mirror_center_y + 18,
+                text=f"Heliostato  AZ {s.az.angle_deg:.1f} / EL {s.el.angle_deg:.1f}",
+                fill="#dbeafe",
+                font=("Segoe UI", 8, "bold"),
+            )
+            shared_incident = (
+                s.facets[0].incident_direction
+                if s.facets and s.facets[0].incident_direction is not None
+                else v_unit(s.target_vector)
+            )
+            for fraction_u, fraction_v in (
+                (-0.55, -0.45),
+                (0.0, -0.45),
+                (0.55, -0.45),
+                (-0.55, 0.45),
+                (0.0, 0.45),
+                (0.55, 0.45),
+            ):
+                ray_start = v_add(
+                    v_mul(mirror_u, mirror_half * fraction_u),
+                    v_mul(mirror_v, mirror_half * fraction_v),
+                )
+                ray_end = v_add(ray_start, v_mul(shared_incident, 0.075))
+                ray_start_x, ray_start_y = project_facet(ray_start)
+                ray_end_x, ray_end_y = project_facet(ray_end)
+                c.create_line(
+                    ray_start_x,
+                    ray_start_y,
+                    ray_end_x,
+                    ray_end_y,
+                    fill="#ffb454",
+                    width=2,
+                    arrow="last",
+                )
+            c.create_oval(focus_px - 7, focus_py - 7, focus_px + 7, focus_py + 7, fill="#58d6e7", outline="#ffffff")
+            c.create_text(focus_px, focus_py - 17, text="Foco", fill="#8ce8f2", font=("Segoe UI", 9, "bold"))
+            for facet in s.facets:
+                facet_px, facet_py = project_facet(facet.center)
+                color = "#d6b95f" if facet.active else "#5f6570"
+                draw_facet_shape(
+                    facet_px,
+                    facet_py,
+                    facet.size * projection_scale * 0.42,
+                    facet.shape,
+                    color,
+                )
+                if s.facet_count <= 18 or facet.id == s.facet_misaligned_id:
+                    c.create_text(facet_px + 7, facet_py - 7, anchor="w", text=facet.id, fill="#ffffff", font=("Consolas", 7))
+                normal_end = v_add(facet.center, v_mul(facet.normal, 0.035))
+                normal_px, normal_py = project_facet(normal_end)
+                c.create_line(facet_px, facet_py, normal_px, normal_py, fill="#f472b6", width=2)
+                if not facet.active:
+                    continue
+                result = result_by_id.get(facet.id)
+                if result is not None:
+                    endpoint = result.impact_point
+                    if endpoint is None:
+                        endpoint = v_add(facet.center, v_mul(result.reflected_direction, s.facet_focal_distance_m))
+                    impact_px, impact_py = project_facet(endpoint)
+                    ray_color = "#66d9ef" if math.isfinite(result.focus_error_m) else "#ef4444"
+                    c.create_line(facet_px, facet_py, impact_px, impact_py, fill=ray_color, width=1)
+            axes_label = {
+                "Superior X-Y": "horizontal y sur / vertical x oeste",
+                "Lateral Y-Z": "y sur / z cenit",
+                "3D isometrica": "3D: x oeste, y sur, z cenit",
+            }.get(s.facet_view_mode, "")
+            c.create_text(schematic[0] + 12, schematic[3] - 14, anchor="sw", text="n rosa | incidente naranja | reflejado cian | " + axes_label, fill="#dbeafe", font=("Segoe UI", 8))
+
+        receiver_cx = (receiver[0] + receiver[2]) / 2.0
+        receiver_cy = (receiver[1] + receiver[3]) / 2.0
+        half_pixels = max(60.0, min((receiver[2] - receiver[0]) * 0.37, (receiver[3] - receiver[1]) * 0.35))
+        half_range_m = max(0.005, s.facet_error_max_m * 1.25)
+        pixels_per_m = half_pixels / half_range_m
+        c.create_line(receiver_cx - half_pixels, receiver_cy, receiver_cx + half_pixels, receiver_cy, fill="#a89b78")
+        c.create_line(receiver_cx, receiver_cy - half_pixels, receiver_cx, receiver_cy + half_pixels, fill="#a89b78")
+        c.create_oval(receiver_cx - 5, receiver_cy - 5, receiver_cx + 5, receiver_cy + 5, outline="#16883f", width=2)
+        for result in s.facet_ray_results:
+            if not (math.isfinite(result.impact_u_m) and math.isfinite(result.impact_v_m)):
+                continue
+            px = clamp(receiver_cx + result.impact_u_m * pixels_per_m, receiver_cx - half_pixels, receiver_cx + half_pixels)
+            py = clamp(receiver_cy - result.impact_v_m * pixels_per_m, receiver_cy - half_pixels, receiver_cy + half_pixels)
+            color = "#2563eb" if result.focus_error_m < 1e-6 else "#d62828"
+            c.create_oval(px - 5, py - 5, px + 5, py + 5, fill=color, outline="#ffffff")
+            if s.facet_count <= 18 or result.facet_id == s.facet_misaligned_id:
+                c.create_text(px + 7, py - 7, anchor="w", text=result.facet_id, fill=color, font=("Consolas", 8, "bold"))
+        c.create_text(receiver_cx, receiver[3] - 14, text=f"u oeste + / v cenit + | escala +/- {half_range_m * 1000.0:.1f} mm", fill="#333333", font=("Segoe UI", 9))
+
+        table_top = int(h * 0.64)
+        c.create_text(24, table_top, anchor="w", text="Resultados por faceta", fill="#111111", font=("Segoe UI", 12, "bold"))
+        visible_facets = s.facets[:18]
+        rows_per_column = 6
+        for index, facet in enumerate(visible_facets):
+            column = index // rows_per_column
+            row = index % rows_per_column
+            x = 24 + column * (w * 0.325)
+            y = table_top + 32 + row * 33
+            result = result_by_id.get(facet.id)
+            if not facet.active:
+                detail = "INACTIVA - sin contribucion"
+                color = "#6b7280"
+            elif result is None or not math.isfinite(result.focus_error_m):
+                detail = "sin cruce con receptor"
+                color = "#b91c1c"
+            else:
+                detail = (
+                    f"u {result.impact_u_m * 1000.0:+8.3f} mm | "
+                    f"v {result.impact_v_m * 1000.0:+8.3f} mm | "
+                    f"error {result.focus_error_m * 1000.0:8.3f} mm"
+                )
+                color = "#16883f" if result.focus_error_m < 1e-6 else "#b91c1c"
+            c.create_text(x, y, anchor="w", text=f"{facet.id}: {detail}", fill=color, font=("Consolas", 9))
+        if len(s.facets) > len(visible_facets):
+            c.create_text(
+                w - 24,
+                table_top,
+                anchor="e",
+                text=f"Se muestran 18 de {len(s.facets)}; todos los impactos permanecen en la grafica",
+                fill="#6b7280",
+                font=("Segoe UI", 9),
+            )
+
+    def draw_spot_view(self) -> None:
+        """Dibuja el mapa combinado de intensidad y sus metricas energeticas."""
+        c = self.spot_canvas
+        c.delete("all")
+        w, h = max(1, c.winfo_width()), max(1, c.winfo_height())
+        c.create_rectangle(0, 0, w, h, fill="#101821", outline="")
+        s = self.state
+        c.create_text(
+            24,
+            22,
+            anchor="w",
+            text="Mapa aproximado de intensidad por faceta",
+            fill="#ffffff",
+            font=("Segoe UI", 15, "bold"),
+        )
+        if not s.spot_map_enabled:
+            c.create_text(
+                w / 2,
+                h / 2,
+                text="Activa 'Spot aproximado por faceta' para generar el mapa",
+                fill="#94a3b8",
+                font=("Segoe UI", 13, "bold"),
+            )
+            return
+        result = s.spot_map_result
+        if result is None:
+            c.create_text(
+                w / 2,
+                h / 2,
+                text="Sin contribuciones: activa el concentrador y al menos una faceta",
+                fill="#94a3b8",
+                font=("Segoe UI", 13, "bold"),
+            )
+            return
+
+        map_size = max(180.0, min(h - 125.0, w * 0.62))
+        left = 34.0
+        top = 78.0
+        right = left + map_size
+        bottom = top + map_size
+        c.create_rectangle(left, top, right, bottom, fill="#020617", outline="#cbd5e1", width=2)
+        display_resolution = min(41, result.resolution)
+        cell = map_size / display_resolution
+        maximum = max(result.intensity, default=0.0)
+
+        def heat_color(value: float) -> str:
+            ratio = clamp(value / maximum if maximum > 1e-18 else 0.0, 0.0, 1.0)
+            stops = (
+                (0.00, (2, 6, 23)),
+                (0.20, (30, 64, 175)),
+                (0.45, (6, 182, 212)),
+                (0.70, (250, 204, 21)),
+                (1.00, (220, 38, 38)),
+            )
+            for stop_index in range(len(stops) - 1):
+                start_value, start_rgb = stops[stop_index]
+                end_value, end_rgb = stops[stop_index + 1]
+                if ratio <= end_value:
+                    fraction = (ratio - start_value) / max(1e-12, end_value - start_value)
+                    rgb = tuple(
+                        round(start + (end - start) * fraction)
+                        for start, end in zip(start_rgb, end_rgb)
+                    )
+                    return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
+            return "#dc2626"
+
+        for display_row in range(display_resolution):
+            source_row = round(display_row * (result.resolution - 1) / (display_resolution - 1))
+            y1 = bottom - (display_row + 1) * cell
+            y2 = bottom - display_row * cell
+            for display_column in range(display_resolution):
+                source_column = round(
+                    display_column * (result.resolution - 1) / (display_resolution - 1)
+                )
+                value = result.value(source_row, source_column)
+                x1 = left + display_column * cell
+                c.create_rectangle(
+                    x1,
+                    y1,
+                    x1 + cell + 1,
+                    y2 + 1,
+                    fill=heat_color(value),
+                    outline="",
+                )
+
+        pixels_per_m = map_size / (2.0 * result.half_size_m)
+        center_x = (left + right) / 2.0
+        center_y = (top + bottom) / 2.0
+        c.create_line(center_x - 10, center_y, center_x + 10, center_y, fill="#22c55e", width=2)
+        c.create_line(center_x, center_y - 10, center_x, center_y + 10, fill="#22c55e", width=2)
+        metrics = result.metrics
+        centroid_x = center_x + metrics.centroid_u_m * pixels_per_m
+        centroid_y = center_y - metrics.centroid_v_m * pixels_per_m
+        c.create_line(centroid_x - 9, centroid_y - 9, centroid_x + 9, centroid_y + 9, fill="#ffffff", width=2)
+        c.create_line(centroid_x - 9, centroid_y + 9, centroid_x + 9, centroid_y - 9, fill="#ffffff", width=2)
+        radius_px = metrics.equivalent_radius_m * pixels_per_m
+        c.create_oval(
+            centroid_x - radius_px,
+            centroid_y - radius_px,
+            centroid_x + radius_px,
+            centroid_y + radius_px,
+            outline="#ffffff",
+            dash=(5, 3),
+        )
+        orientation = math.radians(metrics.orientation_deg)
+        axis_half = min(map_size * 0.25, 2.0 * metrics.major_sigma_m * pixels_per_m)
+        axis_dx = math.cos(orientation) * axis_half
+        axis_dy = -math.sin(orientation) * axis_half
+        c.create_line(
+            centroid_x - axis_dx,
+            centroid_y - axis_dy,
+            centroid_x + axis_dx,
+            centroid_y + axis_dy,
+            fill="#f8fafc",
+            width=2,
+        )
+        c.create_text(center_x, bottom + 25, text="u [mm] oeste +", fill="#cbd5e1", font=("Segoe UI", 9, "bold"))
+        c.create_text(left - 18, center_y, text="v [mm] cenit +", angle=90, fill="#cbd5e1", font=("Segoe UI", 9, "bold"))
+        c.create_text(left, bottom + 48, anchor="w", text=f"{-result.half_size_m * 1000.0:.1f}", fill="#94a3b8", font=("Consolas", 8))
+        c.create_text(right, bottom + 48, anchor="e", text=f"+{result.half_size_m * 1000.0:.1f} mm", fill="#94a3b8", font=("Consolas", 8))
+
+        panel_left = right + 38
+        c.create_rectangle(panel_left, 78, w - 26, h - 42, fill="#172432", outline="#475569")
+        c.create_text(panel_left + 18, 100, anchor="nw", text="Metricas del spot", fill="#ffffff", font=("Segoe UI", 13, "bold"))
+        metric_text = (
+            f"Facetas activas: {len(s.facet_ray_results)}\n"
+            f"Normalizacion: {result.normalization}\n"
+            f"Resolucion: {result.resolution} x {result.resolution}\n"
+            f"Centroide u: {metrics.centroid_u_m * 1000.0:+.3f} mm\n"
+            f"Centroide v: {metrics.centroid_v_m * 1000.0:+.3f} mm\n"
+            f"Error centroide: {metrics.centroid_error_m * 1000.0:.3f} mm\n"
+            f"Intensidad maxima: {metrics.maximum_intensity:.6f}\n"
+            f"Intensidad total: {metrics.total_intensity:.6f}\n"
+            f"Radio equivalente: {metrics.equivalent_radius_m * 1000.0:.3f} mm\n"
+            f"Diametro equivalente: {metrics.equivalent_diameter_m * 1000.0:.3f} mm\n"
+            f"Sigma mayor/menor: {metrics.major_sigma_m * 1000.0:.3f} / {metrics.minor_sigma_m * 1000.0:.3f} mm\n"
+            f"Orientacion: {metrics.orientation_deg:+.2f} deg\n"
+            f"Forma global: {metrics.shape}\n"
+            f"Tiempo de calculo: {s.spot_compute_ms:.3f} ms"
+        )
+        c.create_text(panel_left + 18, 142, anchor="nw", text=metric_text, fill="#dbeafe", font=("Consolas", 10))
+        legend_y = h - 105
+        legend_width = max(80.0, w - panel_left - 80.0)
+        for index in range(50):
+            x1 = panel_left + 18 + legend_width * index / 50.0
+            x2 = panel_left + 18 + legend_width * (index + 1) / 50.0
+            c.create_rectangle(x1, legend_y, x2 + 1, legend_y + 18, fill=heat_color(maximum * index / 49.0), outline="")
+        c.create_text(panel_left + 18, legend_y + 27, anchor="nw", text="0", fill="#cbd5e1", font=("Consolas", 8))
+        c.create_text(panel_left + 18 + legend_width, legend_y + 27, anchor="ne", text=f"pico {maximum:.4g}", fill="#cbd5e1", font=("Consolas", 8))
+
     def draw_diagnostic_view(self) -> None:
         """Dibuja diagnostico numerico de errores, motores, vectores y alertas."""
         c = self.diagnostic_canvas
@@ -1850,7 +4617,7 @@ class DigitalTwinApp:
         c.create_text(24, 22, anchor="w", text="Diagnostico de seguimiento", fill="#111111", font=("Segoe UI", 15, "bold"))
         az_err = wrap_deg(self.state.az.target_deg - self.state.az.angle_deg)
         el_err = self.state.el.target_deg - self.state.el.angle_deg
-        spot_err = math.hypot(self.state.spot_error_x, self.state.spot_error_z) * 1000.0
+        spot_err = self.state.spot_error_radial * 1000.0 if self.state.spot_valid else 0.0
         metrics = [
             ("Error acimut", az_err, "deg", 25.0, "#2b6cb0"),
             ("Error elevacion", el_err, "deg", 25.0, "#805ad5"),
@@ -1867,7 +4634,12 @@ class DigitalTwinApp:
         chart_right = w - 42 if w < 980 else w - 520
         box = (42, 350, chart_right, h - 42)
         self.draw_axes(c, *box, "Historial util: error total del spot", "mm")
-        errs = [math.hypot(p["err_x"], p["err_z"]) * 1000.0 for p in hist]
+        errs = [
+            float(p.get("err_radial", math.hypot(p["err_x"], p["err_z"]))) * 1000.0
+            for p in hist
+            if p.get("spot_valid", True)
+            and math.isfinite(float(p.get("err_radial", math.hypot(p["err_x"], p["err_z"]))))
+        ]
         ymax = max(errs + [10.0])
         self.plot_series(c, box, errs, "#c53030", 0.0, min(max(ymax, 10.0), 500.0))
         c.create_text(w - 360, 100, anchor="nw", text=(
@@ -1876,11 +4648,14 @@ class DigitalTwinApp:
             f"Motor acim: {'ON' if self.state.az.motor_on else 'OFF'}   PWM {self.state.az.pwm * 100:4.0f}%\n"
             f"Motor elev: {'ON' if self.state.el.motor_on else 'OFF'}   PWM {self.state.el.pwm * 100:4.0f}%\n"
             f"cdr (+/-): {self.state.cdr:6.3f} deg\n"
+            f"Actualizacion: {'Manual' if self.state.tracking_updates_manual else f'{self.state.tracking_update_interval_s:g} s'}\n"
+            f"Correcciones: {self.state.tracking_update_count:6d} | desde ultima: {self.state.seconds_since_tracking_update:7.1f} s\n"
+            f"Err max/prom/RMS: {self.state.tracking_error_max_m * 1000.0:6.2f} / {self.state.tracking_error_average_m * 1000.0:6.2f} / {self.state.tracking_error_rms_m * 1000.0:6.2f} mm\n"
             f"Metodo: {self.state.solar_source}\n"
             f"Tiempo usado: {self.active_datetime():%Y-%m-%d %H:%M:%S}"
         ), fill="#222222", font=("Consolas", 11))
         vector_x = max(42, w - 460)
-        vector_y = 282
+        vector_y = 350
         c.create_rectangle(vector_x, vector_y, w - 42, vector_y + 54, fill="#ffffff", outline="#bbbbbb")
         status_label, status_color, _detail = self.system_status()
         c.create_rectangle(vector_x, vector_y, w - 42, vector_y + 24, fill=status_color, outline="#bbbbbb")
@@ -1895,12 +4670,18 @@ class DigitalTwinApp:
             font=("Segoe UI", 9),
         )
         s = self.state
+        target_direction = normalize(s.target_vector)
         vector_text = (
             f"S solar   = ({s.sun_vector[0]:+.3f}, {s.sun_vector[1]:+.3f}, {s.sun_vector[2]:+.3f})\n"
-            f"R target  = ({s.target_vector[0]:+.3f}, {s.target_vector[1]:+.3f}, {s.target_vector[2]:+.3f}) m\n"
+            f"I incidente=({s.incident_direction[0]:+.3f}, {s.incident_direction[1]:+.3f}, {s.incident_direction[2]:+.3f})\n"
+            f"T objetivo= ({target_direction[0]:+.3f}, {target_direction[1]:+.3f}, {target_direction[2]:+.3f})\n"
             f"N ideal   = ({s.ideal_normal[0]:+.3f}, {s.ideal_normal[1]:+.3f}, {s.ideal_normal[2]:+.3f})\n"
             f"N actual  = ({s.actual_normal[0]:+.3f}, {s.actual_normal[1]:+.3f}, {s.actual_normal[2]:+.3f})\n"
-            f"Target crudo EL: {s.raw_target_elev:+.2f} deg | Peralte helio: {s.peralte:+.2f} deg"
+            f"R reflejado=({s.reflected_direction[0]:+.3f}, {s.reflected_direction[1]:+.3f}, {s.reflected_direction[2]:+.3f})\n"
+            f"Angulos i/r = {s.incidence_angle_deg:.4f} / {s.reflection_angle_deg:.4f} deg\n"
+            f"Diferencia R-T = {s.reflection_target_error_deg:.5f} deg\n"
+            f"Target crudo EL: {s.raw_target_elev:+.2f} deg | Peralte helio: {s.peralte:+.2f} deg\n"
+            f"Impacto: {s.spot_status} | error angular: {s.spot_error_angular_deg:.4f} deg"
         )
         c.create_text(vector_x, vector_y + 74, anchor="nw", text=vector_text, fill="#222222", font=("Consolas", 10))
 
@@ -1918,7 +4699,7 @@ class DigitalTwinApp:
             ("Normal ideal", "N = unit(S + unit(R))\nAcim/Elev del heliostato"),
             ("Calibracion", "peralte, offsets, cdr\nlimites y conteos"),
             ("Motor simulado", "PWM por perilla\nencoder y limites\nmovimiento fluido"),
-            ("Concentrador", "18 facetas\nspot y error sobre pantalla"),
+            ("Concentrador", "forma y cantidad configurables\nun rayo central por faceta"),
             ("Alertas", "info, advertencia\ncritica"),
             ("Gemelo visual", "heliostato + concentrador\ncono cdr y rayos"),
             ("Datos", "muestras de sesion\nreplay y CSV"),
@@ -1983,16 +4764,50 @@ class DigitalTwinApp:
 def run_self_test() -> None:
     """Prueba rapida sin abrir GUI.
 
-    Verifica que el modelo pueda calcular geometria, objetivos y error de spot
-    durante varios pasos sin producir NaN o excepciones.
+    Verifica el modelo completo, los casos esenciales del target virtual y la
+    ley de reflexion sin abrir Tkinter.
     """
     state = TwinState()
+    state.use_live_time = False
+    state.simulated_time = _dt.datetime(2026, 6, 21, 12, 0, 0)
+    state.advance_solar_time = False
+    state.peralte = 0.0
+    state.compute_geometry()
+    state.az.angle_deg = state.target_acim
+    state.el.angle_deg = state.target_elev
     for _ in range(20):
-        state.compute_geometry()
         state.update(0.05)
     assert math.isfinite(state.target_acim)
     assert math.isfinite(state.target_elev)
-    assert math.isfinite(state.spot_error_x)
+    assert state.spot_valid
+    assert math.isfinite(state.spot_error_radial)
+    assert state.spot_error_radial < 1e-8
+
+    target = (0.0, 5.0, 0.0)
+    centered = compute_target_impact((0.0, 0.0, 0.0), target, target, 0.01)
+    assert centered.point is not None
+    assert centered.radial_error_m is not None and centered.radial_error_m < 1e-9
+    normal, u_axis, v_axis = target_coordinate_frame(target)
+    side_point, _t = intersect_ray_plane((0.0, 0.0, 0.0), (0.1, 1.0, 0.0), target, normal)
+    assert side_point is not None
+    side_u, _side_v = world_to_target_coordinates(side_point, target, u_axis, v_axis)
+    assert side_u > 0.0
+    parallel_point, parallel_t = intersect_ray_plane(
+        (0.0, 0.0, 0.0),
+        (1.0, 0.0, 0.0),
+        target,
+        normal,
+    )
+    assert parallel_point is None and parallel_t is None
+
+    sun_direction = normalize((-0.35, 0.72, 0.60))
+    target_direction = normalize((0.18, 0.97, -0.16))
+    ideal_normal = compute_heliostat_normal(sun_direction, target_direction)
+    optical = compute_reflection_diagnostics(sun_direction, ideal_normal, target_direction)
+    assert abs(v_norm(ideal_normal) - 1.0) < 1e-12
+    assert abs(v_norm(optical.reflected_direction) - 1.0) < 1e-12
+    assert abs(optical.incidence_angle_deg - optical.reflection_angle_deg) < 1e-10
+    assert optical.target_difference_deg < 1e-6
     print("self-test ok")
 
 

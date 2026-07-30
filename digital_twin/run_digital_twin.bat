@@ -15,5 +15,13 @@ if not exist "%FREECAD_PY%" (
 
 cd /d "%PROJECT_DIR%"
 "%FREECAD_PY%" digital_twin\run_digital_twin.py %*
+set "EXIT_CODE=%ERRORLEVEL%"
 
-endlocal
+if not "%EXIT_CODE%"=="0" (
+  echo.
+  echo El simulador termino con error ^(codigo %EXIT_CODE%^).
+  echo Revisa el mensaje anterior para conocer la causa.
+  pause
+)
+
+endlocal & exit /b %EXIT_CODE%
