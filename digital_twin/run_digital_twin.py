@@ -596,6 +596,8 @@ class TwinState:
     simulated_time: _dt.datetime = field(default_factory=_dt.datetime.now)
     advance_solar_time: bool = True
     solar_time_scale: float = 60.0
+    initial_simulated_time: _dt.datetime | None = None
+    simulation_step_s: float = 60.0
     rx: float = 0.0
     ry: float = 5.55
     rz: float = -0.40
@@ -663,6 +665,48 @@ class TwinState:
     correction_count: int = 0
     _last_tracking_state: bool = field(default=True, repr=False)
     history: deque = field(default_factory=lambda: deque(maxlen=720))
+
+    def __post_init__(self) -> None:
+        """Inicializa el origen reiniciable del reloj simulado."""
+        if self.initial_simulated_time is None:
+            self.initial_simulated_time = self.simulated_time
+        self.set_history_limit(self.history_limit)
+
+    def set_simulated_start_time(self, when: _dt.datetime) -> None:
+        """Define fecha/hora inicial y coloca el reloj exactamente en ella."""
+        self.initial_simulated_time = when
+        self.simulated_time = when
+        self.seconds_since_last_correction = 0.0
+        self.clear_history()
+
+    def reset_simulated_time(self) -> None:
+        """Regresa el reloj a la fecha/hora inicial configurada."""
+        if self.initial_simulated_time is None:
+            self.initial_simulated_time = self.simulated_time
+        self.simulated_time = self.initial_simulated_time
+        self.seconds_since_last_correction = 0.0
+        self.clear_history()
+
+    def step_simulated_time(self, seconds: float | None = None) -> float:
+        """Avanza manualmente una cantidad definida y devuelve ese avance."""
+        step_s = self.simulation_step_s if seconds is None else float(seconds)
+        step_s = max(0.0, step_s)
+        if self.use_live_time:
+            return 0.0
+        self.simulated_time += _dt.timedelta(seconds=step_s)
+        self.seconds_since_last_correction += step_s
+        return step_s
+
+    def advance_simulation_clock(self, real_elapsed_s: float) -> float:
+        """Avanza el reloj segun su multiplicador y devuelve segundos simulados."""
+        real_elapsed_s = max(0.0, float(real_elapsed_s))
+        if self.use_live_time:
+            return real_elapsed_s
+        if not self.advance_solar_time:
+            return 0.0
+        simulated_elapsed_s = real_elapsed_s * max(0.0, self.solar_time_scale)
+        self.simulated_time += _dt.timedelta(seconds=simulated_elapsed_s)
+        return simulated_elapsed_s
 
     def set_history_limit(self, limit: int) -> None:
         """Cambia el limite conservando las muestras mas recientes."""
@@ -794,10 +838,7 @@ class TwinState:
         if not self.running:
             return
         dt = max(0.0, float(dt))
-        solar_elapsed_s = dt
-        if not self.use_live_time and self.advance_solar_time:
-            solar_elapsed_s = dt * max(0.0, self.solar_time_scale)
-            self.simulated_time += _dt.timedelta(seconds=solar_elapsed_s)
+        solar_elapsed_s = self.advance_simulation_clock(dt)
 
         # Al apagar seguimiento se congela la pose mecanica, pero el reloj y
         # la posicion solar siguen avanzando. Este desacoplamiento produce la
@@ -1056,6 +1097,7 @@ class DigitalTwinApp:
         self.var("free_mode", self.state.free_mode)
         self.var("specific_time", not self.state.use_live_time)
         self.var("advance_solar_time", self.state.advance_solar_time)
+        self.var("time_scale_choice", f"{self.state.solar_time_scale:g}x")
         self.var("scale_to_model", self.state.scale_to_model)
         for name in (
             "show_sun_vector",
@@ -1083,7 +1125,7 @@ class DigitalTwinApp:
             "camera_offset_acim",
             "cdr",
             "delay_s",
-            "solar_time_scale",
+            "simulation_step_s",
             "target_scale_m",
             "target_tolerance_m",
             "mirror_size_m",
@@ -1133,6 +1175,7 @@ class DigitalTwinApp:
 
         ttk.Label(left, text="Sistema de Control Horno Solar IER - Gemelo Digital", style="Title.TLabel").pack(fill="x", padx=10, pady=(10, 8))
         self.build_mode_block(left)
+        self.build_time_block(left)
         self.build_motor_block(left)
         self.build_geometry_block(left)
         self.build_auto_block(left)
@@ -1196,6 +1239,60 @@ class DigitalTwinApp:
         for i in range(3):
             row.columnconfigure(i, weight=1)
         self.update_mode_visuals()
+
+    def build_time_block(self, parent: ttk.Frame) -> None:
+        """Construye los controles independientes del reloj solar simulado."""
+        frame = ttk.LabelFrame(parent, text="Reloj de simulacion", style="Block.TLabelframe")
+        frame.pack(fill="x", padx=10, pady=5)
+        grid = ttk.Frame(frame, style="Panel.TFrame")
+        grid.pack(fill="x", padx=8, pady=7)
+        self.add_switch(grid, "Reloj simulado", "advance_solar_time", row=0, col=0)
+        ttk.Label(grid, text="Multiplicador", style="Small.TLabel").grid(row=0, column=2, sticky="w", padx=2, pady=2)
+        ttk.OptionMenu(
+            grid,
+            self.vars["time_scale_choice"],
+            self.vars["time_scale_choice"].get(),
+            "1x",
+            "10x",
+            "60x",
+            "120x",
+            "600x",
+            command=lambda _=None: self.apply_controls(),
+        ).grid(row=0, column=3, sticky="ew", padx=2, pady=2)
+        self.add_entry(grid, "Paso manual (s)", "simulation_step_s", 1, 0)
+        ttk.Button(
+            grid,
+            text="AVANZAR PASO",
+            style="Gold.TButton",
+            command=self.step_simulation_clock,
+        ).grid(row=1, column=2, columnspan=2, sticky="ew", padx=3, pady=3)
+        ttk.Button(
+            grid,
+            text="PAUSAR / REANUDAR",
+            style="Manual.TButton",
+            command=self.toggle_simulation_clock,
+        ).grid(row=2, column=0, columnspan=2, sticky="ew", padx=3, pady=3)
+        ttk.Button(
+            grid,
+            text="REINICIAR TIEMPO",
+            style="Gold.TButton",
+            command=self.reset_simulation_clock,
+        ).grid(row=2, column=2, columnspan=2, sticky="ew", padx=3, pady=3)
+        ttk.Button(
+            grid,
+            text="APLICAR FECHA/HORA INICIAL",
+            style="Gold.TButton",
+            command=self.apply_initial_datetime,
+        ).grid(row=3, column=0, columnspan=4, sticky="ew", padx=3, pady=3)
+        self.clock_status_label = ttk.Label(
+            grid,
+            text="",
+            style="Readout.TLabel",
+            anchor="center",
+        )
+        self.clock_status_label.grid(row=4, column=0, columnspan=4, sticky="ew", padx=3, pady=(6, 2))
+        for col in (1, 3):
+            grid.columnconfigure(col, weight=1)
 
     def build_motor_block(self, parent: ttk.Frame) -> None:
         """Construye controles manuales de motores y perillas de velocidad."""
@@ -1272,18 +1369,16 @@ class DigitalTwinApp:
         grid.pack(fill="x", padx=8, pady=7)
         self.add_switch(grid, "Seguimiento", "tracking", row=0, col=0)
         self.add_switch(grid, "Escalar R a maqueta", "scale_to_model", row=0, col=2)
-        self.add_switch(grid, "Avanzar tiempo solar", "advance_solar_time", row=1, col=0)
-        self.add_entry(grid, "Escala de tiempo (x)", "solar_time_scale", 1, 2)
-        self.add_entry(grid, "Consideracion (+/- cdr)", "cdr", 2, 0)
-        self.add_entry(grid, "Refresco (s)", "delay_s", 2, 2)
-        self.add_entry(grid, "Limite historial", "history_limit", 3, 0)
+        self.add_entry(grid, "Consideracion (+/- cdr)", "cdr", 1, 0)
+        self.add_entry(grid, "Refresco (s)", "delay_s", 1, 2)
+        self.add_entry(grid, "Limite historial", "history_limit", 2, 0)
         ttk.Button(
             grid,
             text="Limpiar trayectoria",
             style="Gold.TButton",
             command=self.clear_spot_history,
-        ).grid(row=3, column=2, columnspan=2, sticky="ew", padx=4, pady=3)
-        ttk.Label(grid, text="Vista 3D", style="Small.TLabel").grid(row=4, column=0, sticky="w", pady=2, padx=2)
+        ).grid(row=2, column=2, columnspan=2, sticky="ew", padx=4, pady=3)
+        ttk.Label(grid, text="Vista 3D", style="Small.TLabel").grid(row=3, column=0, sticky="w", pady=2, padx=2)
         ttk.OptionMenu(
             grid,
             self.vars["view_mode"],
@@ -1293,7 +1388,7 @@ class DigitalTwinApp:
             "Lateral",
             "Superior",
             command=lambda _=None: self.apply_controls(),
-        ).grid(row=4, column=1, sticky="ew", pady=2, padx=2)
+        ).grid(row=3, column=1, sticky="ew", pady=2, padx=2)
         grid.columnconfigure(1, weight=1)
         grid.columnconfigure(3, weight=1)
 
@@ -1595,6 +1690,56 @@ class DigitalTwinApp:
         self.state.clear_history()
         self.log_event(f"Trayectoria limpiada ({removed} muestras)")
 
+    def apply_initial_datetime(self) -> None:
+        """Aplica los campos de fecha/hora como nuevo origen de simulacion."""
+        date_text = str(self.vars["date_text"].get()).strip()
+        time_text = str(self.vars["time_text"].get()).strip()
+        try:
+            when = _dt.datetime.fromisoformat(f"{date_text}T{time_text}")
+        except ValueError:
+            self.invalid_time_text = "Fecha/hora especifica invalida"
+            self.log_event(self.invalid_time_text)
+            return
+        self.vars["specific_time"].set(True)
+        self.state.use_live_time = False
+        self.state.set_simulated_start_time(when)
+        self.last_time_input = (date_text, time_text)
+        self.last_specific_time_enabled = True
+        self.invalid_time_text = ""
+        self.log_event(f"Tiempo inicial aplicado: {when:%Y-%m-%d %H:%M:%S}")
+
+    def toggle_simulation_clock(self) -> None:
+        """Pausa o reanuda solamente el reloj, sin detener la interfaz."""
+        if not bool(self.vars["specific_time"].get()):
+            self.log_event("El control del reloj requiere Fecha especifica ON")
+            return
+        running = not bool(self.vars["advance_solar_time"].get())
+        self.vars["advance_solar_time"].set(running)
+        self.state.advance_solar_time = running
+        self.log_event("Reloj simulado reanudado" if running else "Reloj simulado pausado")
+
+    def reset_simulation_clock(self) -> None:
+        """Reinicia el reloj en el origen definido y limpia su trayectoria."""
+        self.apply_controls()
+        if self.state.use_live_time:
+            self.log_event("Reinicio de tiempo requiere Fecha especifica ON")
+            return
+        self.state.reset_simulated_time()
+        self.state.compute_geometry()
+        self.log_event(f"Reloj reiniciado: {self.state.simulated_time:%Y-%m-%d %H:%M:%S}")
+
+    def step_simulation_clock(self) -> None:
+        """Pausa el reloj y ejecuta un avance manual de tamaño configurable."""
+        self.apply_controls()
+        if self.state.use_live_time:
+            self.log_event("Avance por paso requiere Fecha especifica ON")
+            return
+        self.vars["advance_solar_time"].set(False)
+        self.state.advance_solar_time = False
+        advanced_s = self.state.step_simulated_time()
+        self.state.compute_geometry()
+        self.log_event(f"Paso de tiempo: +{advanced_s:g} s")
+
     def toggle_run(self) -> None:
         """Pausa o reanuda la simulacion sin cerrar la interfaz."""
         self.state.running = not self.state.running
@@ -1658,7 +1803,8 @@ class DigitalTwinApp:
                 time_text = str(self.vars["time_text"].get()).strip()
                 time_input = (date_text, time_text)
                 if time_input != self.last_time_input or not self.last_specific_time_enabled:
-                    self.state.simulated_time = _dt.datetime.fromisoformat(f"{date_text}T{time_text}")
+                    when = _dt.datetime.fromisoformat(f"{date_text}T{time_text}")
+                    self.state.set_simulated_start_time(when)
                     self.last_time_input = time_input
                 if self.invalid_time_text:
                     self.log_event("Fecha especifica valida restaurada")
@@ -1701,7 +1847,9 @@ class DigitalTwinApp:
         # Saneamiento de parametros para evitar valores negativos o imposibles.
         self.state.cdr = max(0.0, float(self.state.cdr))
         self.state.delay_s = max(0.01, float(self.state.delay_s))
-        self.state.solar_time_scale = max(0.0, min(float(self.state.solar_time_scale), 3600.0))
+        scale_text = str(self.vars["time_scale_choice"].get()).strip().lower().removesuffix("x")
+        self.state.solar_time_scale = max(0.0, min(float(scale_text), 3600.0))
+        self.state.simulation_step_s = max(0.0, min(float(self.state.simulation_step_s), 86400.0))
         self.state.set_history_limit(int(self.state.history_limit))
         self.state.target_scale_m = max(0.001, float(self.state.target_scale_m))
         self.state.target_tolerance_m = max(0.0, float(self.state.target_tolerance_m))
@@ -1717,6 +1865,14 @@ class DigitalTwinApp:
         s = self.state
         return {
             "timestamp": (_dt.datetime.now() if s.use_live_time else s.simulated_time).isoformat(timespec="seconds"),
+            "initial_simulated_time": (
+                s.initial_simulated_time.isoformat(timespec="seconds")
+                if s.initial_simulated_time is not None
+                else ""
+            ),
+            "simulation_clock_running": s.advance_solar_time,
+            "simulation_time_scale": s.solar_time_scale,
+            "simulation_step_s": s.simulation_step_s,
             "iteration": s.iterations,
             "mode": self.current_mode,
             "state": self.last_status_label,
@@ -1793,6 +1949,9 @@ class DigitalTwinApp:
             sample.get("elapsed_since_correction_s", s.seconds_since_last_correction)
         )
         s.correction_count = int(sample.get("correction_count", s.correction_count))
+        s.advance_solar_time = bool(sample.get("simulation_clock_running", s.advance_solar_time))
+        s.solar_time_scale = float(sample.get("simulation_time_scale", s.solar_time_scale))
+        s.simulation_step_s = float(sample.get("simulation_step_s", s.simulation_step_s))
         s.zenith = float(sample["zenith_deg"])
         s.altitude = float(sample["altitude_deg"])
         s.solar_azimuth = float(sample["solar_azimuth_deg"])
@@ -1957,6 +2116,15 @@ class DigitalTwinApp:
             if math.isfinite(s.reflection_target_error_deg)
             else "NO DEFINIDO"
         )
+        if s.use_live_time:
+            clock_text = f"TIEMPO REAL | {self.active_datetime():%Y-%m-%d %H:%M:%S}"
+        else:
+            clock_state = "EN MARCHA" if s.advance_solar_time else "PAUSADO"
+            clock_text = (
+                f"{clock_state} | {self.active_datetime():%Y-%m-%d %H:%M:%S} | "
+                f"{s.solar_time_scale:g}x"
+            )
+        self.clock_status_label.configure(text=clock_text)
         values = {
             "zenith": f"{s.zenith:8.4f}",
             "altitude": f"{s.altitude:8.4f}",
