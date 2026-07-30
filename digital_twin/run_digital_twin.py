@@ -663,6 +663,22 @@ class TwinState:
     history_limit: int = 720
     seconds_since_last_correction: float = 0.0
     correction_count: int = 0
+    tracking_update_interval_s: float = 1.0
+    tracking_updates_manual: bool = False
+    seconds_since_tracking_update: float = 0.0
+    tracking_update_count: int = 0
+    tracking_schedule_initialized: bool = False
+    tracking_update_pending: bool = False
+    tracking_corrected_this_step: bool = False
+    held_target_acim: float = 0.0
+    held_target_elev: float = 0.0
+    tracking_error_max_m: float = 0.0
+    tracking_error_average_m: float = 0.0
+    tracking_error_rms_m: float = 0.0
+    _interval_error_max_m: float = field(default=0.0, repr=False)
+    _interval_error_sum_m: float = field(default=0.0, repr=False)
+    _interval_error_sq_sum_m: float = field(default=0.0, repr=False)
+    _interval_error_samples: int = field(default=0, repr=False)
     _last_tracking_state: bool = field(default=True, repr=False)
     history: deque = field(default_factory=lambda: deque(maxlen=720))
 
@@ -678,6 +694,7 @@ class TwinState:
         self.simulated_time = when
         self.seconds_since_last_correction = 0.0
         self.clear_history()
+        self.reset_tracking_schedule()
 
     def reset_simulated_time(self) -> None:
         """Regresa el reloj a la fecha/hora inicial configurada."""
@@ -686,6 +703,7 @@ class TwinState:
         self.simulated_time = self.initial_simulated_time
         self.seconds_since_last_correction = 0.0
         self.clear_history()
+        self.reset_tracking_schedule()
 
     def step_simulated_time(self, seconds: float | None = None) -> float:
         """Avanza manualmente una cantidad definida y devuelve ese avance."""
@@ -695,6 +713,7 @@ class TwinState:
             return 0.0
         self.simulated_time += _dt.timedelta(seconds=step_s)
         self.seconds_since_last_correction += step_s
+        self.seconds_since_tracking_update += step_s
         return step_s
 
     def advance_simulation_clock(self, real_elapsed_s: float) -> float:
@@ -723,6 +742,78 @@ class TwinState:
         """Registra una actuacion de los ejes y reinicia su cronometro."""
         self.seconds_since_last_correction = 0.0
         self.correction_count += 1
+
+    def configure_tracking_updates(self, interval_s: float | None) -> None:
+        """Configura intervalo automatico o modo manual y reinicia su ciclo."""
+        manual = interval_s is None
+        new_interval = self.tracking_update_interval_s if manual else max(0.001, float(interval_s))
+        if manual != self.tracking_updates_manual or abs(new_interval - self.tracking_update_interval_s) > 1e-12:
+            self.tracking_updates_manual = manual
+            self.tracking_update_interval_s = new_interval
+            self.reset_tracking_schedule()
+
+    def reset_tracking_schedule(self) -> None:
+        """Reinicia contador, temporizador, target retenido y estadisticas."""
+        self.seconds_since_tracking_update = 0.0
+        self.tracking_update_count = 0
+        self.tracking_schedule_initialized = False
+        self.tracking_update_pending = False
+        self.tracking_corrected_this_step = False
+        self.held_target_acim = self.az.angle_deg
+        self.held_target_elev = self.el.angle_deg
+        self.tracking_error_max_m = 0.0
+        self.tracking_error_average_m = 0.0
+        self.tracking_error_rms_m = 0.0
+        self._reset_interval_error_accumulators()
+
+    def request_tracking_update(self) -> None:
+        """Solicita una correccion para el siguiente paso del simulador."""
+        self.tracking_update_pending = True
+
+    def _reset_interval_error_accumulators(self) -> None:
+        self._interval_error_max_m = 0.0
+        self._interval_error_sum_m = 0.0
+        self._interval_error_sq_sum_m = 0.0
+        self._interval_error_samples = 0
+
+    def _accumulate_tracking_error(self) -> None:
+        if not self.spot_valid or not math.isfinite(self.spot_error_radial):
+            return
+        error_m = max(0.0, self.spot_error_radial)
+        self._interval_error_max_m = max(self._interval_error_max_m, error_m)
+        self._interval_error_sum_m += error_m
+        self._interval_error_sq_sum_m += error_m * error_m
+        self._interval_error_samples += 1
+
+    def _finish_tracking_interval(self) -> None:
+        if self._interval_error_samples:
+            count = self._interval_error_samples
+            self.tracking_error_max_m = self._interval_error_max_m
+            self.tracking_error_average_m = self._interval_error_sum_m / count
+            self.tracking_error_rms_m = math.sqrt(self._interval_error_sq_sum_m / count)
+        self._reset_interval_error_accumulators()
+
+    def _apply_tracking_update(self) -> None:
+        """Captura la normal solar actual y aplica una correccion instantanea."""
+        if self.tracking_schedule_initialized:
+            self._finish_tracking_interval()
+        self.held_target_acim = self.target_acim
+        self.held_target_elev = self.target_elev
+        self.az.target_deg = self.held_target_acim
+        self.el.target_deg = self.held_target_elev
+        if self.az.motor_on:
+            self.az.angle_deg = clamp(self.held_target_acim, self.az.limit_min, self.az.limit_max)
+            self.az.counts = int(round(self.az.angle_deg * self.az.counts_per_degree))
+        if self.el.motor_on:
+            self.el.angle_deg = clamp(self.held_target_elev, self.el.limit_min, self.el.limit_max)
+            self.el.counts = int(round(self.el.angle_deg * self.el.counts_per_degree))
+        self.az.ina = self.az.inb = self.el.ina = self.el.inb = 0
+        self.seconds_since_tracking_update = 0.0
+        self.tracking_update_count += 1
+        self.tracking_schedule_initialized = True
+        self.tracking_update_pending = False
+        self.tracking_corrected_this_step = True
+        self.mark_correction()
 
     def target_vector_scaled(self) -> tuple[float, float, float]:
         """Devuelve el vector R hacia el concentrador en escala real o maqueta."""
@@ -831,9 +922,9 @@ class TwinState:
     def update(self, dt: float, target_override: tuple[float, float] | None = None) -> None:
         """Avanza un paso temporal de la simulacion.
 
-        Si target_override existe, por ejemplo en modo Home, se usa ese objetivo
-        angular en lugar del calculado por Sol/target. Si el modo automatico y
-        seguimiento estan activos, mueve los ejes suavemente hacia el objetivo.
+        En seguimiento automatico el Sol se recalcula siempre, pero el target
+        retenido y la pose solo cambian al vencer el intervalo configurado. El
+        modo Home conserva su movimiento suave independiente del programador.
         """
         if not self.running:
             return
@@ -845,30 +936,51 @@ class TwinState:
         # deriva fisica del rayo reflejado sobre el target.
         if self._last_tracking_state and not self.tracking:
             self.seconds_since_last_correction = 0.0
+        elif not self._last_tracking_state and self.tracking:
+            self.reset_tracking_schedule()
         self._last_tracking_state = self.tracking
+        self.tracking_corrected_this_step = False
 
         self.compute_geometry()
         if target_override:
+            self.tracking_schedule_initialized = False
             self.az.target_deg = target_override[0]
             self.el.target_deg = target_override[1]
+            previous_az = self.az.angle_deg
+            previous_el = self.el.angle_deg
+            if self.automatic and not self.free_mode:
+                self.az.update_closed_loop(dt, self.cdr)
+                self.el.update_closed_loop(dt, self.cdr)
+            if (
+                abs(self.az.angle_deg - previous_az) > 1e-9
+                or abs(self.el.angle_deg - previous_el) > 1e-9
+            ):
+                self.mark_correction()
+            else:
+                self.seconds_since_last_correction += solar_elapsed_s
+        elif self.automatic and self.tracking and not self.free_mode:
+            if not self.tracking_schedule_initialized:
+                self._apply_tracking_update()
+            else:
+                self.seconds_since_tracking_update += solar_elapsed_s
+                self.seconds_since_last_correction = self.seconds_since_tracking_update
+                self._accumulate_tracking_error()
+                interval_due = (
+                    not self.tracking_updates_manual
+                    and self.seconds_since_tracking_update + 1e-9 >= self.tracking_update_interval_s
+                )
+                if self.tracking_update_pending or interval_due:
+                    self._apply_tracking_update()
+            self.az.target_deg = self.held_target_acim
+            self.el.target_deg = self.held_target_elev
+            self.az.ina = self.az.inb = self.el.ina = self.el.inb = 0
         else:
             self.az.target_deg = self.target_acim
             self.el.target_deg = self.target_elev
-        previous_az = self.az.angle_deg
-        previous_el = self.el.angle_deg
-        if self.automatic and (self.tracking or target_override is not None) and not self.free_mode:
-            self.az.update_closed_loop(dt, self.cdr)
-            self.el.update_closed_loop(dt, self.cdr)
-        else:
             self.az.ina = self.az.inb = self.el.ina = self.el.inb = 0
-        axes_moved = (
-            abs(self.az.angle_deg - previous_az) > 1e-9
-            or abs(self.el.angle_deg - previous_el) > 1e-9
-        )
-        if axes_moved:
-            self.mark_correction()
-        else:
             self.seconds_since_last_correction += solar_elapsed_s
+            if self.tracking_schedule_initialized:
+                self.seconds_since_tracking_update += solar_elapsed_s
         # Los motores pueden cambiar la normal durante este mismo paso. El
         # impacto se vuelve a calcular para que la pantalla no lleve un ciclo de
         # retraso respecto de los angulos mostrados.
@@ -883,6 +995,15 @@ class TwinState:
                     _dt.datetime.now() if self.use_live_time else self.simulated_time
                 ).isoformat(timespec="milliseconds"),
                 "elapsed_since_correction_s": self.seconds_since_last_correction,
+                "elapsed_since_tracking_update_s": self.seconds_since_tracking_update,
+                "tracking_update_count": self.tracking_update_count,
+                "tracking_corrected": self.tracking_corrected_this_step,
+                "tracking_interval_s": (
+                    "manual" if self.tracking_updates_manual else self.tracking_update_interval_s
+                ),
+                "tracking_error_max_m": self.tracking_error_max_m,
+                "tracking_error_average_m": self.tracking_error_average_m,
+                "tracking_error_rms_m": self.tracking_error_rms_m,
                 "tracking": self.tracking,
                 "az": self.az.angle_deg,
                 "el": self.el.angle_deg,
@@ -1033,6 +1154,7 @@ class DigitalTwinApp:
         self.last_time_input: tuple[str, str] | None = None
         self.last_specific_time_enabled = False
         self.last_tracking_enabled = self.state.tracking
+        self.last_tracking_interval_choice = "1 s"
         self.state.automatic = False
         self.state.free_mode = True
         self.set_home_pose_instant()
@@ -1098,6 +1220,7 @@ class DigitalTwinApp:
         self.var("specific_time", not self.state.use_live_time)
         self.var("advance_solar_time", self.state.advance_solar_time)
         self.var("time_scale_choice", f"{self.state.solar_time_scale:g}x")
+        self.var("tracking_interval_choice", self.last_tracking_interval_choice)
         self.var("scale_to_model", self.state.scale_to_model)
         for name in (
             "show_sun_vector",
@@ -1369,16 +1492,35 @@ class DigitalTwinApp:
         grid.pack(fill="x", padx=8, pady=7)
         self.add_switch(grid, "Seguimiento", "tracking", row=0, col=0)
         self.add_switch(grid, "Escalar R a maqueta", "scale_to_model", row=0, col=2)
-        self.add_entry(grid, "Consideracion (+/- cdr)", "cdr", 1, 0)
-        self.add_entry(grid, "Refresco (s)", "delay_s", 1, 2)
-        self.add_entry(grid, "Limite historial", "history_limit", 2, 0)
+        ttk.Label(grid, text="Actualizar cada", style="Small.TLabel").grid(row=1, column=0, sticky="w", padx=2, pady=2)
+        ttk.OptionMenu(
+            grid,
+            self.vars["tracking_interval_choice"],
+            self.vars["tracking_interval_choice"].get(),
+            "1 s",
+            "5 s",
+            "10 s",
+            "30 s",
+            "60 s",
+            "Manual",
+            command=lambda _=None: self.apply_controls(),
+        ).grid(row=1, column=1, sticky="ew", padx=2, pady=2)
+        ttk.Button(
+            grid,
+            text="CORREGIR AHORA",
+            style="Gold.TButton",
+            command=self.request_tracking_correction,
+        ).grid(row=1, column=2, columnspan=2, sticky="ew", padx=4, pady=3)
+        self.add_entry(grid, "Consideracion (+/- cdr)", "cdr", 2, 0)
+        self.add_entry(grid, "Refresco (s)", "delay_s", 2, 2)
+        self.add_entry(grid, "Limite historial", "history_limit", 3, 0)
         ttk.Button(
             grid,
             text="Limpiar trayectoria",
             style="Gold.TButton",
             command=self.clear_spot_history,
-        ).grid(row=2, column=2, columnspan=2, sticky="ew", padx=4, pady=3)
-        ttk.Label(grid, text="Vista 3D", style="Small.TLabel").grid(row=3, column=0, sticky="w", pady=2, padx=2)
+        ).grid(row=3, column=2, columnspan=2, sticky="ew", padx=4, pady=3)
+        ttk.Label(grid, text="Vista 3D", style="Small.TLabel").grid(row=4, column=0, sticky="w", pady=2, padx=2)
         ttk.OptionMenu(
             grid,
             self.vars["view_mode"],
@@ -1388,7 +1530,7 @@ class DigitalTwinApp:
             "Lateral",
             "Superior",
             command=lambda _=None: self.apply_controls(),
-        ).grid(row=3, column=1, sticky="ew", pady=2, padx=2)
+        ).grid(row=4, column=1, sticky="ew", pady=2, padx=2)
         grid.columnconfigure(1, weight=1)
         grid.columnconfigure(3, weight=1)
 
@@ -1486,6 +1628,9 @@ class DigitalTwinApp:
             ("Limites", "limit_status"),
             ("Estado motores", "motor_status"),
             ("Desde ultima correccion", "correction_elapsed"),
+            ("Intervalo de seguimiento", "tracking_interval"),
+            ("Correcciones programadas", "tracking_update_count"),
+            ("Error max/prom/RMS", "tracking_error_stats"),
             ("Historial deriva", "history_status"),
             ("Iteraciones", "iterations"),
         ]
@@ -1641,6 +1786,7 @@ class DigitalTwinApp:
             self.vars["automatic"].set(True)
             self.vars["free_mode"].set(False)
             self.vars["mode_status"].set("MODO ACTIVO: AUTOMATICO")
+            self.state.reset_tracking_schedule()
             self.log_event("Modo automatico")
         elif mode == "manual":
             self.vars["automatic"].set(False)
@@ -1689,6 +1835,15 @@ class DigitalTwinApp:
         removed = len(self.state.history)
         self.state.clear_history()
         self.log_event(f"Trayectoria limpiada ({removed} muestras)")
+
+    def request_tracking_correction(self) -> None:
+        """Solicita una actualizacion inmediata de la orientacion retenida."""
+        self.apply_controls()
+        if not self.state.automatic or self.state.free_mode or not self.state.tracking:
+            self.log_event("Correccion requiere modo Automatico y Seguimiento ON")
+            return
+        self.state.request_tracking_update()
+        self.log_event("Correccion manual solicitada")
 
     def apply_initial_datetime(self) -> None:
         """Aplica los campos de fecha/hora como nuevo origen de simulacion."""
@@ -1825,6 +1980,14 @@ class DigitalTwinApp:
                 self.log_event("Seguimiento detenido: pose mecanica congelada")
             self.last_tracking_enabled = tracking_enabled
 
+        interval_choice = str(self.vars["tracking_interval_choice"].get()).strip()
+        if interval_choice.lower() == "manual":
+            self.state.configure_tracking_updates(None)
+        else:
+            interval_value = float(interval_choice.lower().removesuffix("s").strip())
+            self.state.configure_tracking_updates(interval_value)
+        self.last_tracking_interval_choice = interval_choice
+
         # Variables propias de cada eje: velocidad por PWM, motor ON/OFF,
         # limites, escala de conteo y velocidad maxima.
         self.state.az.pwm = float(self.vars["az_pwm"].get())
@@ -1893,6 +2056,14 @@ class DigitalTwinApp:
             "tracking": s.tracking,
             "elapsed_since_correction_s": s.seconds_since_last_correction,
             "correction_count": s.correction_count,
+            "tracking_updates_manual": s.tracking_updates_manual,
+            "tracking_update_interval_s": s.tracking_update_interval_s,
+            "elapsed_since_tracking_update_s": s.seconds_since_tracking_update,
+            "tracking_update_count": s.tracking_update_count,
+            "tracking_corrected": s.tracking_corrected_this_step,
+            "tracking_error_max_mm": s.tracking_error_max_m * 1000.0,
+            "tracking_error_average_mm": s.tracking_error_average_m * 1000.0,
+            "tracking_error_rms_mm": s.tracking_error_rms_m * 1000.0,
             "zenith_deg": s.zenith,
             "altitude_deg": s.altitude,
             "solar_azimuth_deg": s.solar_azimuth,
@@ -1949,6 +2120,18 @@ class DigitalTwinApp:
             sample.get("elapsed_since_correction_s", s.seconds_since_last_correction)
         )
         s.correction_count = int(sample.get("correction_count", s.correction_count))
+        s.tracking_updates_manual = bool(sample.get("tracking_updates_manual", s.tracking_updates_manual))
+        s.tracking_update_interval_s = float(
+            sample.get("tracking_update_interval_s", s.tracking_update_interval_s)
+        )
+        s.seconds_since_tracking_update = float(
+            sample.get("elapsed_since_tracking_update_s", s.seconds_since_tracking_update)
+        )
+        s.tracking_update_count = int(sample.get("tracking_update_count", s.tracking_update_count))
+        s.tracking_corrected_this_step = bool(sample.get("tracking_corrected", False))
+        s.tracking_error_max_m = float(sample.get("tracking_error_max_mm", 0.0)) / 1000.0
+        s.tracking_error_average_m = float(sample.get("tracking_error_average_mm", 0.0)) / 1000.0
+        s.tracking_error_rms_m = float(sample.get("tracking_error_rms_mm", 0.0)) / 1000.0
         s.advance_solar_time = bool(sample.get("simulation_clock_running", s.advance_solar_time))
         s.solar_time_scale = float(sample.get("simulation_time_scale", s.solar_time_scale))
         s.simulation_step_s = float(sample.get("simulation_step_s", s.simulation_step_s))
@@ -2142,6 +2325,17 @@ class DigitalTwinApp:
             "limit_status": limit_text,
             "motor_status": f"AZ {'ON' if s.az.motor_on else 'OFF'} | EL {'ON' if s.el.motor_on else 'OFF'}",
             "correction_elapsed": f"{s.seconds_since_last_correction:8.1f} s solares",
+            "tracking_interval": (
+                f"Manual | {s.seconds_since_tracking_update:7.1f} s"
+                if s.tracking_updates_manual
+                else f"{s.tracking_update_interval_s:g} s | transcurrido {s.seconds_since_tracking_update:7.1f} s"
+            ),
+            "tracking_update_count": f"{s.tracking_update_count:d}",
+            "tracking_error_stats": (
+                f"{s.tracking_error_max_m * 1000.0:6.2f} / "
+                f"{s.tracking_error_average_m * 1000.0:6.2f} / "
+                f"{s.tracking_error_rms_m * 1000.0:6.2f} mm"
+            ),
             "history_status": f"{len(s.history):d} / {s.history_limit:d} muestras",
             "iterations": f"{s.iterations:d}",
         }
@@ -2673,8 +2867,9 @@ class DigitalTwinApp:
             anchor="w",
             text=(
                 f"Hora solar {self.active_datetime():%Y-%m-%d %H:%M:%S}   |   "
-                f"desde correccion {self.state.seconds_since_last_correction:.1f} s   |   "
-                f"historial {len(hist)}/{self.state.history_limit}"
+                f"intervalo {'Manual' if self.state.tracking_updates_manual else f'{self.state.tracking_update_interval_s:g} s'}   |   "
+                f"desde actualizacion {self.state.seconds_since_tracking_update:.1f} s   |   "
+                f"correcciones {self.state.tracking_update_count}"
             ),
             fill="#222222",
             font=("Consolas", 10),
@@ -2697,20 +2892,20 @@ class DigitalTwinApp:
             "Error horizontal u vs tiempo",
             "Error vertical v vs tiempo",
             "Error radial vs tiempo",
-            "Tiempo desde ultima correccion",
+            "Tiempo desde ultima actualizacion",
         )
         labels = ("mm", "mm", "mm", "s solares")
         colors = ("#2563eb", "#805ad5", "#c53030", "#16883f")
-        keys = ("err_u", "err_v", "err_radial", "elapsed_since_correction_s")
+        keys = ("err_u", "err_v", "err_radial", "elapsed_since_tracking_update_s")
         series: list[list[float]] = []
         for key in keys:
             values: list[float] = []
             for sample in hist:
-                if key != "elapsed_since_correction_s" and not sample.get("spot_valid", True):
+                if key != "elapsed_since_tracking_update_s" and not sample.get("spot_valid", True):
                     continue
                 value = float(sample.get(key, 0.0))
                 if math.isfinite(value):
-                    values.append(value if key == "elapsed_since_correction_s" else value * 1000.0)
+                    values.append(value if key == "elapsed_since_tracking_update_s" else value * 1000.0)
             series.append(values)
 
         for box, title, label, color, values in zip(boxes, titles, labels, colors, series):
@@ -2718,12 +2913,32 @@ class DigitalTwinApp:
             if title == "Error radial vs tiempo":
                 upper = max(values + [1.0])
                 self.plot_series(c, box, values, color, 0.0, upper)
-            elif title == "Tiempo desde ultima correccion":
+            elif title == "Tiempo desde ultima actualizacion":
                 upper = max(values + [1.0])
                 self.plot_series(c, box, values, color, 0.0, upper)
             else:
                 extent = max([abs(value) for value in values] + [1.0])
                 self.plot_series(c, box, values, color, -extent, extent)
+
+        # Marcas verticales doradas: instantes en que la pose fue corregida.
+        if len(hist) >= 2:
+            radial_box = boxes[2]
+            plot_left = radial_box[0] + 45
+            plot_right = radial_box[2] - 16
+            plot_top = radial_box[1] + 18
+            plot_bottom = radial_box[3] - 30
+            for idx, sample in enumerate(hist):
+                if sample.get("tracking_corrected", False):
+                    marker_x = plot_left + (plot_right - plot_left) * idx / (len(hist) - 1)
+                    c.create_line(marker_x, plot_top, marker_x, plot_bottom, fill="#d69e2e", width=1, dash=(3, 3))
+            c.create_text(
+                radial_box[2] - 24,
+                radial_box[1] + 28,
+                anchor="ne",
+                text="dorado = correccion",
+                fill="#9a6700",
+                font=("Segoe UI", 8, "bold"),
+            )
 
         if not hist:
             c.create_text(w / 2, h / 2, text="Sin muestras: inicia la simulacion para formar la trayectoria", fill="#6b7280", font=("Segoe UI", 13, "bold"))
@@ -2775,11 +2990,14 @@ class DigitalTwinApp:
             f"Motor acim: {'ON' if self.state.az.motor_on else 'OFF'}   PWM {self.state.az.pwm * 100:4.0f}%\n"
             f"Motor elev: {'ON' if self.state.el.motor_on else 'OFF'}   PWM {self.state.el.pwm * 100:4.0f}%\n"
             f"cdr (+/-): {self.state.cdr:6.3f} deg\n"
+            f"Actualizacion: {'Manual' if self.state.tracking_updates_manual else f'{self.state.tracking_update_interval_s:g} s'}\n"
+            f"Correcciones: {self.state.tracking_update_count:6d} | desde ultima: {self.state.seconds_since_tracking_update:7.1f} s\n"
+            f"Err max/prom/RMS: {self.state.tracking_error_max_m * 1000.0:6.2f} / {self.state.tracking_error_average_m * 1000.0:6.2f} / {self.state.tracking_error_rms_m * 1000.0:6.2f} mm\n"
             f"Metodo: {self.state.solar_source}\n"
             f"Tiempo usado: {self.active_datetime():%Y-%m-%d %H:%M:%S}"
         ), fill="#222222", font=("Consolas", 11))
         vector_x = max(42, w - 460)
-        vector_y = 282
+        vector_y = 350
         c.create_rectangle(vector_x, vector_y, w - 42, vector_y + 54, fill="#ffffff", outline="#bbbbbb")
         status_label, status_color, _detail = self.system_status()
         c.create_rectangle(vector_x, vector_y, w - 42, vector_y + 24, fill=status_color, outline="#bbbbbb")
