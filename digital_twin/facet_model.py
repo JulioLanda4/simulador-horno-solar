@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Tuple
 
 
-Vector3 = tuple[float, float, float]
+Vector3 = Tuple[float, float, float]
 
 
 def add(a: Vector3, b: Vector3) -> Vector3:

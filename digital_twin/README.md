@@ -51,6 +51,12 @@ Tambien puedes abrir con doble clic:
 digital_twin\run_digital_twin.bat
 ```
 
+Puedes comprobar el lanzador sin abrir la interfaz:
+
+```cmd
+digital_twin\run_digital_twin.bat --self-test
+```
+
 En PowerShell:
 
 ```powershell

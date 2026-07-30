@@ -15,5 +15,6 @@ if not exist "%FREECAD_PY%" (
 
 cd /d "%PROJECT_DIR%"
 "%FREECAD_PY%" digital_twin\run_digital_twin.py %*
+set "EXIT_CODE=%ERRORLEVEL%"
 
-endlocal
+endlocal & exit /b %EXIT_CODE%
