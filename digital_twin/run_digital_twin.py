@@ -56,6 +56,16 @@ except ModuleNotFoundError:  # Permite ejecutar directamente este archivo .py.
         trace_facets,
     )
 
+try:
+    from digital_twin.spot_model import (
+        SpotMapResult,
+        SpotMetrics,
+        contribution_from_ray,
+        generate_spot_map,
+    )
+except ModuleNotFoundError:  # Permite ejecutar directamente este archivo .py.
+    from spot_model import SpotMapResult, SpotMetrics, contribution_from_ray, generate_spot_map
+
 
 TAU = 2.0 * math.pi
 DEG = math.pi / 180.0
@@ -720,6 +730,14 @@ class TwinState:
     facet_error_average_m: float = 0.0
     facet_compute_ms: float = 0.0
     _facet_previous_count: int = field(default=9, repr=False)
+    spot_map_enabled: bool = False
+    spot_base_sigma_m: float = 0.003
+    spot_map_half_size_m: float = 0.050
+    spot_map_resolution: int = 51
+    spot_normalization: str = "Total = 1"
+    spot_map_result: SpotMapResult | None = field(default=None, repr=False)
+    spot_metrics: SpotMetrics = field(default_factory=SpotMetrics)
+    spot_compute_ms: float = 0.0
     motion_error_sample: MotionErrorSample = field(default_factory=MotionErrorSample)
     ideal_spot_u: float = 0.0
     ideal_spot_v: float = 0.0
@@ -992,6 +1010,9 @@ class TwinState:
             self.facet_error_max_m = 0.0
             self.facet_error_average_m = 0.0
             self.facet_compute_ms = 0.0
+            self.spot_map_result = None
+            self.spot_metrics = SpotMetrics()
+            self.spot_compute_ms = 0.0
             return
         started = time.perf_counter()
         concentrator_center = self.scenario_target_vector(self.error_mode)
@@ -1002,6 +1023,9 @@ class TwinState:
             self.facet_error_max_m = float("nan")
             self.facet_error_average_m = float("nan")
             self.facet_compute_ms = (time.perf_counter() - started) * 1000.0
+            self.spot_map_result = None
+            self.spot_metrics = SpotMetrics()
+            self.spot_compute_ms = 0.0
             return
         focal_distance = max(0.001, float(self.facet_focal_distance_m))
         self.facet_focus = v_sub(concentrator_center, v_mul(axis, focal_distance))
@@ -1033,6 +1057,47 @@ class TwinState:
         self.facet_error_max_m = max(errors, default=0.0)
         self.facet_error_average_m = sum(errors) / len(errors) if errors else 0.0
         self.facet_compute_ms = (time.perf_counter() - started) * 1000.0
+        self.compute_spot_distribution()
+
+    def compute_spot_distribution(self) -> None:
+        """Superpone las manchas de las facetas activas sobre el receptor."""
+        if not self.spot_map_enabled or not self.facet_ray_results:
+            self.spot_map_result = None
+            self.spot_metrics = SpotMetrics()
+            self.spot_compute_ms = 0.0
+            return
+        started = time.perf_counter()
+        facet_by_id = {facet.id: facet for facet in self.facets}
+        contributions = []
+        for result in self.facet_ray_results:
+            facet = facet_by_id.get(result.facet_id)
+            if facet is None:
+                continue
+            if facet.shape == "Circular":
+                area_factor = math.pi / 4.0
+            elif facet.shape == "Hexagonal":
+                area_factor = math.sqrt(3.0) / 2.0
+            else:
+                area_factor = 1.0
+            receiver_cosine = abs(
+                v_dot(v_unit(result.reflected_direction), v_unit(self.facet_receiver_normal))
+            )
+            contribution = contribution_from_ray(
+                result,
+                receiver_normal=self.facet_receiver_normal,
+                base_sigma_m=max(1e-5, float(self.spot_base_sigma_m)),
+                weight=area_factor * receiver_cosine,
+            )
+            if contribution is not None:
+                contributions.append(contribution)
+        self.spot_map_result = generate_spot_map(
+            contributions,
+            half_size_m=max(0.001, float(self.spot_map_half_size_m)),
+            resolution=self.spot_map_resolution,
+            normalization=self.spot_normalization,
+        )
+        self.spot_metrics = self.spot_map_result.metrics
+        self.spot_compute_ms = (time.perf_counter() - started) * 1000.0
 
     def target_vector_scaled(self) -> tuple[float, float, float]:
         """Devuelve el vector R hacia el concentrador en escala real o maqueta."""
@@ -1253,6 +1318,12 @@ class TwinState:
                 "facet_error_max_m": self.facet_error_max_m,
                 "facet_error_average_m": self.facet_error_average_m,
                 "facet_compute_ms": self.facet_compute_ms,
+                "spot_map_enabled": self.spot_map_enabled,
+                "spot_centroid_error_m": self.spot_metrics.centroid_error_m,
+                "spot_maximum_intensity": self.spot_metrics.maximum_intensity,
+                "spot_equivalent_diameter_m": self.spot_metrics.equivalent_diameter_m,
+                "spot_shape": self.spot_metrics.shape,
+                "spot_compute_ms": self.spot_compute_ms,
                 "tracking": self.tracking,
                 "az": self.az.angle_deg,
                 "el": self.el.angle_deg,
@@ -1536,6 +1607,14 @@ class DigitalTwinApp:
             "facet_view_mode",
         ):
             self.var(facet_name, getattr(self.state, facet_name))
+        for spot_name in (
+            "spot_map_enabled",
+            "spot_base_sigma_m",
+            "spot_map_half_size_m",
+            "spot_map_resolution",
+            "spot_normalization",
+        ):
+            self.var(spot_name, getattr(self.state, spot_name))
         for name in (
             "show_sun_vector",
             "show_normal_vector",
@@ -1620,6 +1699,7 @@ class DigitalTwinApp:
         self.build_error_block(left)
         self.build_correction_block(left)
         self.build_facet_block(left)
+        self.build_spot_block(left)
         self.build_calibration_block(left)
         self.build_status_block(left)
 
@@ -1634,6 +1714,7 @@ class DigitalTwinApp:
         self.error_canvas = tk.Canvas(notebook, bg="#f4f4f4", highlightthickness=0)
         self.correction_canvas = tk.Canvas(notebook, bg="#f4f4f4", highlightthickness=0)
         self.facet_canvas = tk.Canvas(notebook, bg="#f4f4f4", highlightthickness=0)
+        self.spot_canvas = tk.Canvas(notebook, bg="#101821", highlightthickness=0)
         self.diagnostic_canvas = tk.Canvas(notebook, bg="#f4f4f4", highlightthickness=0)
         self.logic_canvas = tk.Canvas(notebook, bg="#f7f7f7", highlightthickness=0)
         self.log_canvas = tk.Canvas(notebook, bg="#f7f7f7", highlightthickness=0)
@@ -1644,6 +1725,7 @@ class DigitalTwinApp:
         notebook.add(self.error_canvas, text="Comparacion de errores")
         notebook.add(self.correction_canvas, text="Correccion de deriva")
         notebook.add(self.facet_canvas, text="Facetas / rayos")
+        notebook.add(self.spot_canvas, text="Mapa de intensidad")
         notebook.add(self.diagnostic_canvas, text="Diagnostico")
         notebook.add(self.logic_canvas, text="Flujo del gemelo")
         notebook.add(self.log_canvas, text="Eventos")
@@ -2109,6 +2191,48 @@ class DigitalTwinApp:
             "3D isometrica",
             command=lambda _=None: self.apply_controls(),
         ).grid(row=11, column=1, columnspan=3, sticky="ew", padx=2, pady=(6, 2))
+        for col in (1, 3):
+            grid.columnconfigure(col, weight=1)
+
+    def build_spot_block(self, parent: ttk.Frame) -> None:
+        """Construye controles del mapa aproximado de intensidad por faceta."""
+        frame = ttk.LabelFrame(parent, text="Spot aproximado por faceta", style="Block.TLabelframe")
+        frame.pack(fill="x", padx=10, pady=5)
+        grid = ttk.Frame(frame, style="Panel.TFrame")
+        grid.pack(fill="x", padx=8, pady=7)
+        self.add_switch(grid, "Activar mapa", "spot_map_enabled", row=0, col=0)
+        self.add_entry(grid, "Sigma base (m)", "spot_base_sigma_m", 1, 0)
+        self.add_entry(grid, "Rango +/- (m)", "spot_map_half_size_m", 1, 2)
+        self.add_entry(grid, "Resolucion impar", "spot_map_resolution", 2, 0)
+        ttk.Label(grid, text="Normalizacion", style="Small.TLabel").grid(
+            row=2, column=2, sticky="w", padx=2, pady=2
+        )
+        ttk.OptionMenu(
+            grid,
+            self.vars["spot_normalization"],
+            self.vars["spot_normalization"].get(),
+            "Total = 1",
+            "Pico = 1",
+            "Sin normalizar",
+            command=lambda _=None: self.apply_controls(),
+        ).grid(row=2, column=3, sticky="ew", padx=2, pady=2)
+        self.spot_status_label = ttk.Label(
+            grid,
+            text="Mapa de intensidad desactivado",
+            style="Small.TLabel",
+            wraplength=450,
+            justify="left",
+        )
+        self.spot_status_label.grid(
+            row=3, column=0, columnspan=4, sticky="ew", padx=2, pady=(6, 2)
+        )
+        ttk.Label(
+            grid,
+            text="Cada impacto genera una gaussiana; la incidencia oblicua la alarga.",
+            style="Small.TLabel",
+            wraplength=450,
+            justify="left",
+        ).grid(row=4, column=0, columnspan=4, sticky="ew", padx=2, pady=(2, 2))
         for col in (1, 3):
             grid.columnconfigure(col, weight=1)
 
@@ -2669,6 +2793,22 @@ class DigitalTwinApp:
         )
         self.state.facet_misaligned_id = self.state.facet_misaligned_id.strip().upper() or "F1"
 
+        self.state.spot_base_sigma_m = max(1e-5, float(self.state.spot_base_sigma_m))
+        self.state.spot_map_half_size_m = max(
+            0.001, float(self.state.spot_map_half_size_m)
+        )
+        spot_resolution = max(21, min(int(self.state.spot_map_resolution), 121))
+        if spot_resolution % 2 == 0:
+            spot_resolution += 1
+        self.state.spot_map_resolution = spot_resolution
+        self.vars["spot_map_resolution"].set(spot_resolution)
+        if self.state.spot_normalization not in (
+            "Total = 1",
+            "Pico = 1",
+            "Sin normalizar",
+        ):
+            self.state.spot_normalization = "Total = 1"
+
         # Variables propias de cada eje: velocidad por PWM, motor ON/OFF,
         # limites, escala de conteo y velocidad maxima.
         self.state.az.pwm = float(self.vars["az_pwm"].get())
@@ -2775,6 +2915,19 @@ class DigitalTwinApp:
             "facet_error_max_mm": s.facet_error_max_m * 1000.0,
             "facet_error_average_mm": s.facet_error_average_m * 1000.0,
             "facet_compute_ms": s.facet_compute_ms,
+            "spot_map_enabled": s.spot_map_enabled,
+            "spot_base_sigma_m": s.spot_base_sigma_m,
+            "spot_map_half_size_m": s.spot_map_half_size_m,
+            "spot_map_resolution": s.spot_map_resolution,
+            "spot_normalization": s.spot_normalization,
+            "spot_centroid_u_mm": s.spot_metrics.centroid_u_m * 1000.0,
+            "spot_centroid_v_mm": s.spot_metrics.centroid_v_m * 1000.0,
+            "spot_centroid_error_mm": s.spot_metrics.centroid_error_m * 1000.0,
+            "spot_maximum_intensity": s.spot_metrics.maximum_intensity,
+            "spot_total_intensity": s.spot_metrics.total_intensity,
+            "spot_equivalent_diameter_mm": s.spot_metrics.equivalent_diameter_m * 1000.0,
+            "spot_shape": s.spot_metrics.shape,
+            "spot_compute_ms": s.spot_compute_ms,
             "zenith_deg": s.zenith,
             "altitude_deg": s.altitude,
             "solar_azimuth_deg": s.solar_azimuth,
@@ -2890,6 +3043,24 @@ class DigitalTwinApp:
         s.facet_error_max_m = float(sample.get("facet_error_max_mm", 0.0)) / 1000.0
         s.facet_error_average_m = float(sample.get("facet_error_average_mm", 0.0)) / 1000.0
         s.facet_compute_ms = float(sample.get("facet_compute_ms", 0.0))
+        s.spot_map_enabled = bool(sample.get("spot_map_enabled", s.spot_map_enabled))
+        s.spot_base_sigma_m = float(sample.get("spot_base_sigma_m", s.spot_base_sigma_m))
+        s.spot_map_half_size_m = float(
+            sample.get("spot_map_half_size_m", s.spot_map_half_size_m)
+        )
+        s.spot_map_resolution = int(sample.get("spot_map_resolution", s.spot_map_resolution))
+        s.spot_normalization = str(sample.get("spot_normalization", s.spot_normalization))
+        s.spot_metrics = SpotMetrics(
+            centroid_u_m=float(sample.get("spot_centroid_u_mm", 0.0)) / 1000.0,
+            centroid_v_m=float(sample.get("spot_centroid_v_mm", 0.0)) / 1000.0,
+            centroid_error_m=float(sample.get("spot_centroid_error_mm", 0.0)) / 1000.0,
+            maximum_intensity=float(sample.get("spot_maximum_intensity", 0.0)),
+            total_intensity=float(sample.get("spot_total_intensity", 0.0)),
+            equivalent_diameter_m=float(sample.get("spot_equivalent_diameter_mm", 0.0)) / 1000.0,
+            equivalent_radius_m=float(sample.get("spot_equivalent_diameter_mm", 0.0)) / 2000.0,
+            shape=str(sample.get("spot_shape", "Sin spot")),
+        )
+        s.spot_compute_ms = float(sample.get("spot_compute_ms", 0.0))
         s.advance_solar_time = bool(sample.get("simulation_clock_running", s.advance_solar_time))
         s.solar_time_scale = float(sample.get("simulation_time_scale", s.solar_time_scale))
         s.simulation_step_s = float(sample.get("simulation_step_s", s.simulation_step_s))
@@ -3003,6 +3174,19 @@ class DigitalTwinApp:
         else:
             facet_status = "Modelo de facetas desactivado"
         self.facet_status_label.configure(text=facet_status)
+        if self.state.spot_map_enabled and self.state.spot_map_result is not None:
+            metrics = self.state.spot_metrics
+            spot_status = (
+                f"Centroide {metrics.centroid_u_m * 1000.0:+.2f} / "
+                f"{metrics.centroid_v_m * 1000.0:+.2f} mm | "
+                f"diametro eq. {metrics.equivalent_diameter_m * 1000.0:.2f} mm | "
+                f"{metrics.shape} | {self.state.spot_compute_ms:.2f} ms"
+            )
+        elif self.state.spot_map_enabled:
+            spot_status = "Activa el concentrador y al menos una faceta"
+        else:
+            spot_status = "Mapa de intensidad desactivado"
+        self.spot_status_label.configure(text=spot_status)
         self.update_mode_visuals()
 
     def update_mode_visuals(self) -> None:
@@ -3057,6 +3241,7 @@ class DigitalTwinApp:
         self.draw_error_view()
         self.draw_correction_view()
         self.draw_facet_view()
+        self.draw_spot_view()
         self.draw_diagnostic_view()
         self.draw_logic()
         self.draw_event_log()
@@ -4266,6 +4451,156 @@ class DigitalTwinApp:
                 fill="#6b7280",
                 font=("Segoe UI", 9),
             )
+
+    def draw_spot_view(self) -> None:
+        """Dibuja el mapa combinado de intensidad y sus metricas energeticas."""
+        c = self.spot_canvas
+        c.delete("all")
+        w, h = max(1, c.winfo_width()), max(1, c.winfo_height())
+        c.create_rectangle(0, 0, w, h, fill="#101821", outline="")
+        s = self.state
+        c.create_text(
+            24,
+            22,
+            anchor="w",
+            text="Mapa aproximado de intensidad por faceta",
+            fill="#ffffff",
+            font=("Segoe UI", 15, "bold"),
+        )
+        if not s.spot_map_enabled:
+            c.create_text(
+                w / 2,
+                h / 2,
+                text="Activa 'Spot aproximado por faceta' para generar el mapa",
+                fill="#94a3b8",
+                font=("Segoe UI", 13, "bold"),
+            )
+            return
+        result = s.spot_map_result
+        if result is None:
+            c.create_text(
+                w / 2,
+                h / 2,
+                text="Sin contribuciones: activa el concentrador y al menos una faceta",
+                fill="#94a3b8",
+                font=("Segoe UI", 13, "bold"),
+            )
+            return
+
+        map_size = max(180.0, min(h - 125.0, w * 0.62))
+        left = 34.0
+        top = 78.0
+        right = left + map_size
+        bottom = top + map_size
+        c.create_rectangle(left, top, right, bottom, fill="#020617", outline="#cbd5e1", width=2)
+        display_resolution = min(41, result.resolution)
+        cell = map_size / display_resolution
+        maximum = max(result.intensity, default=0.0)
+
+        def heat_color(value: float) -> str:
+            ratio = clamp(value / maximum if maximum > 1e-18 else 0.0, 0.0, 1.0)
+            stops = (
+                (0.00, (2, 6, 23)),
+                (0.20, (30, 64, 175)),
+                (0.45, (6, 182, 212)),
+                (0.70, (250, 204, 21)),
+                (1.00, (220, 38, 38)),
+            )
+            for stop_index in range(len(stops) - 1):
+                start_value, start_rgb = stops[stop_index]
+                end_value, end_rgb = stops[stop_index + 1]
+                if ratio <= end_value:
+                    fraction = (ratio - start_value) / max(1e-12, end_value - start_value)
+                    rgb = tuple(
+                        round(start + (end - start) * fraction)
+                        for start, end in zip(start_rgb, end_rgb)
+                    )
+                    return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
+            return "#dc2626"
+
+        for display_row in range(display_resolution):
+            source_row = round(display_row * (result.resolution - 1) / (display_resolution - 1))
+            y1 = bottom - (display_row + 1) * cell
+            y2 = bottom - display_row * cell
+            for display_column in range(display_resolution):
+                source_column = round(
+                    display_column * (result.resolution - 1) / (display_resolution - 1)
+                )
+                value = result.value(source_row, source_column)
+                x1 = left + display_column * cell
+                c.create_rectangle(
+                    x1,
+                    y1,
+                    x1 + cell + 1,
+                    y2 + 1,
+                    fill=heat_color(value),
+                    outline="",
+                )
+
+        pixels_per_m = map_size / (2.0 * result.half_size_m)
+        center_x = (left + right) / 2.0
+        center_y = (top + bottom) / 2.0
+        c.create_line(center_x - 10, center_y, center_x + 10, center_y, fill="#22c55e", width=2)
+        c.create_line(center_x, center_y - 10, center_x, center_y + 10, fill="#22c55e", width=2)
+        metrics = result.metrics
+        centroid_x = center_x + metrics.centroid_u_m * pixels_per_m
+        centroid_y = center_y - metrics.centroid_v_m * pixels_per_m
+        c.create_line(centroid_x - 9, centroid_y - 9, centroid_x + 9, centroid_y + 9, fill="#ffffff", width=2)
+        c.create_line(centroid_x - 9, centroid_y + 9, centroid_x + 9, centroid_y - 9, fill="#ffffff", width=2)
+        radius_px = metrics.equivalent_radius_m * pixels_per_m
+        c.create_oval(
+            centroid_x - radius_px,
+            centroid_y - radius_px,
+            centroid_x + radius_px,
+            centroid_y + radius_px,
+            outline="#ffffff",
+            dash=(5, 3),
+        )
+        orientation = math.radians(metrics.orientation_deg)
+        axis_half = min(map_size * 0.25, 2.0 * metrics.major_sigma_m * pixels_per_m)
+        axis_dx = math.cos(orientation) * axis_half
+        axis_dy = -math.sin(orientation) * axis_half
+        c.create_line(
+            centroid_x - axis_dx,
+            centroid_y - axis_dy,
+            centroid_x + axis_dx,
+            centroid_y + axis_dy,
+            fill="#f8fafc",
+            width=2,
+        )
+        c.create_text(center_x, bottom + 25, text="u [mm] oeste +", fill="#cbd5e1", font=("Segoe UI", 9, "bold"))
+        c.create_text(left - 18, center_y, text="v [mm] cenit +", angle=90, fill="#cbd5e1", font=("Segoe UI", 9, "bold"))
+        c.create_text(left, bottom + 48, anchor="w", text=f"{-result.half_size_m * 1000.0:.1f}", fill="#94a3b8", font=("Consolas", 8))
+        c.create_text(right, bottom + 48, anchor="e", text=f"+{result.half_size_m * 1000.0:.1f} mm", fill="#94a3b8", font=("Consolas", 8))
+
+        panel_left = right + 38
+        c.create_rectangle(panel_left, 78, w - 26, h - 42, fill="#172432", outline="#475569")
+        c.create_text(panel_left + 18, 100, anchor="nw", text="Metricas del spot", fill="#ffffff", font=("Segoe UI", 13, "bold"))
+        metric_text = (
+            f"Facetas activas: {len(s.facet_ray_results)}\n"
+            f"Normalizacion: {result.normalization}\n"
+            f"Resolucion: {result.resolution} x {result.resolution}\n"
+            f"Centroide u: {metrics.centroid_u_m * 1000.0:+.3f} mm\n"
+            f"Centroide v: {metrics.centroid_v_m * 1000.0:+.3f} mm\n"
+            f"Error centroide: {metrics.centroid_error_m * 1000.0:.3f} mm\n"
+            f"Intensidad maxima: {metrics.maximum_intensity:.6f}\n"
+            f"Intensidad total: {metrics.total_intensity:.6f}\n"
+            f"Radio equivalente: {metrics.equivalent_radius_m * 1000.0:.3f} mm\n"
+            f"Diametro equivalente: {metrics.equivalent_diameter_m * 1000.0:.3f} mm\n"
+            f"Sigma mayor/menor: {metrics.major_sigma_m * 1000.0:.3f} / {metrics.minor_sigma_m * 1000.0:.3f} mm\n"
+            f"Orientacion: {metrics.orientation_deg:+.2f} deg\n"
+            f"Forma global: {metrics.shape}\n"
+            f"Tiempo de calculo: {s.spot_compute_ms:.3f} ms"
+        )
+        c.create_text(panel_left + 18, 142, anchor="nw", text=metric_text, fill="#dbeafe", font=("Consolas", 10))
+        legend_y = h - 105
+        legend_width = max(80.0, w - panel_left - 80.0)
+        for index in range(50):
+            x1 = panel_left + 18 + legend_width * index / 50.0
+            x2 = panel_left + 18 + legend_width * (index + 1) / 50.0
+            c.create_rectangle(x1, legend_y, x2 + 1, legend_y + 18, fill=heat_color(maximum * index / 49.0), outline="")
+        c.create_text(panel_left + 18, legend_y + 27, anchor="nw", text="0", fill="#cbd5e1", font=("Consolas", 8))
+        c.create_text(panel_left + 18 + legend_width, legend_y + 27, anchor="ne", text=f"pico {maximum:.4g}", fill="#cbd5e1", font=("Consolas", 8))
 
     def draw_diagnostic_view(self) -> None:
         """Dibuja diagnostico numerico de errores, motores, vectores y alertas."""
