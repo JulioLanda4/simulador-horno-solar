@@ -121,7 +121,10 @@ class CorrectionModelTests(unittest.TestCase):
         errors = [state.corrected_spot_radial]
         self.assertGreater(errors[0], state.target_tolerance_m)
 
-        for _ in range(6):
+        # Con las dimensiones fisicas completas del perfil (target a 5.55 m),
+        # la misma ganancia requiere mas actualizaciones que el antiguo modelo
+        # reducido, pero debe conservar convergencia monotona.
+        for _ in range(20):
             state.request_drift_correction()
             state._update_drift_correction(0.0)
             state.compute_geometry()
