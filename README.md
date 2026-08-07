@@ -9,6 +9,12 @@ El objetivo es que funcione con Sol real y que conserve una arquitectura semejan
 - HoSIER: referencia de arquitectura de sistema real.
 - Mini horno solar del IER-UNAM: referencia geometrica inicial y referencia visual de la maqueta.
 
+## Software de simulacion
+
+- [`digital_twin/`](digital_twin/): version 2.0 estable de escritorio en Python/Tkinter.
+- [`web_app/`](web_app/): edicion web serverless en desarrollo, ejecutada en el
+  navegador con Shinylive/Pyodide y preparada para GitHub Pages.
+
 ## Documentos principales
 
 - [`FUENTES.md`](FUENTES.md): indice de fuentes locales del proyecto.

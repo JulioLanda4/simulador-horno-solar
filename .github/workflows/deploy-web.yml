@@ -1,0 +1,69 @@
+name: Deploy simulador web to GitHub Pages
+
+on:
+  push:
+    branches: [main, codex/simulador-web]
+    paths:
+      - "web_app/**"
+      - "digital_twin/error_model.py"
+      - "digital_twin/correction_model.py"
+      - "digital_twin/facet_model.py"
+      - "digital_twin/spot_model.py"
+      - ".github/workflows/deploy-web.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar GitHub Pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - name: Instalar uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Probar el nucleo web
+        run: uv run --project web_app python -m unittest web_app.test_engine
+
+      - name: Preparar aplicacion Shinylive
+        run: |
+          mkdir -p build/digital_twin build/www
+          cp web_app/app.py web_app/engine.py build/
+          cp web_app/www/styles.css build/www/
+          cp digital_twin/error_model.py build/digital_twin/
+          cp digital_twin/correction_model.py build/digital_twin/
+          cp digital_twin/facet_model.py build/digital_twin/
+          cp digital_twin/spot_model.py build/digital_twin/
+          touch build/digital_twin/__init__.py
+
+      - name: Exportar sitio estatico
+        run: uv run --project web_app shinylive export build _site
+
+      - name: Subir artefacto de Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Publicar en GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
